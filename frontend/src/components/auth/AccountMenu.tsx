@@ -2,21 +2,18 @@
 
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
-import { useQueryClient } from "@tanstack/react-query";
-import { Settings, LogOut } from "lucide-react";
-import { createClient } from "@/lib/supabase/client";
-import { useProfile } from "@/lib/hooks";
+import { Settings, LogOut, KeyRound } from "lucide-react";
+import { profileName, useLogout, useProfile } from "@/lib/hooks";
+import { openGeminiKeyDialog } from "@/lib/geminiKey";
 
 /**
- * 공용 계정 메뉴(D26): 아바타/이름 → [프로필·설정 / 로그아웃].
+ * 공용 계정 메뉴(D26): 이니셜 아바타/이름 → [프로필·설정 / Gemini API 키 / 로그아웃].
  * 교사·관리자 콘솔 헤더에 배치(사이드바가 없어 로그아웃 경로가 없던 문제 해결).
  * dark=관리자 콘솔(다크 톤), 기본=라이트.
  */
 export function AccountMenu({ dark = false }: { dark?: boolean }) {
   const { data: profile } = useProfile();
-  const router = useRouter();
-  const queryClient = useQueryClient();
+  const handleLogout = useLogout();
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
@@ -28,18 +25,8 @@ export function AccountMenu({ dark = false }: { dark?: boolean }) {
     return () => document.removeEventListener("mousedown", onDoc);
   }, []);
 
-  const handleLogout = async () => {
-    const supabase = createClient();
-    await supabase.auth.signOut();
-    queryClient.clear();
-    router.push("/login");
-    router.refresh();
-  };
-
-  const name = profile?.display_name || profile?.email || "계정";
-  const initial = (profile?.display_name || profile?.email || "?")
-    .slice(0, 1)
-    .toUpperCase();
+  const name = profileName(profile) || "계정";
+  const initial = (profileName(profile) || "?").slice(0, 1).toUpperCase();
 
   const panel = dark
     ? "border-white/15 bg-[#25211a] text-[#e7e3d8]"
@@ -82,6 +69,16 @@ export function AccountMenu({ dark = false }: { dark?: boolean }) {
           >
             <Settings size={14} /> 프로필·설정
           </Link>
+          <button
+            type="button"
+            onClick={() => {
+              setOpen(false);
+              openGeminiKeyDialog();
+            }}
+            className={`flex w-full items-center gap-2 px-3 py-2 text-left ${itemHover}`}
+          >
+            <KeyRound size={14} /> Gemini API 키
+          </button>
           <button
             type="button"
             onClick={handleLogout}

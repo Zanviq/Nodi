@@ -8,8 +8,15 @@ import {
   CheckCircle2,
   AlertTriangle,
   Info,
+  KeyRound,
+  RotateCcw,
 } from "lucide-react";
-import { ApiError, uploadFile } from "@/lib/api";
+import { ApiError, retryFile, uploadFile } from "@/lib/api";
+import {
+  isGeminiKeyError,
+  openGeminiKeyDialog,
+  useHasGeminiKey,
+} from "@/lib/geminiKey";
 import { classMaterialsKey, useClassMaterials } from "@/lib/queries";
 import type { FileRow, FileStatus } from "@/lib/types";
 
@@ -43,6 +50,7 @@ const STATUS_META: Record<
   indexed: { label: "완료", cls: "bg-positive/20 text-positive", progress: false },
   partial: { label: "부분 실패", cls: "bg-warning/20 text-warning", progress: false },
   failed: { label: "실패", cls: "bg-danger/20 text-danger", progress: false },
+  needs_key: { label: "키 필요", cls: "bg-accent/40 text-accent-fg", progress: false },
 };
 
 export function MaterialsTab({ classId }: { classId: string }) {
@@ -67,8 +75,8 @@ export function MaterialsTab({ classId }: { classId: string }) {
         queryKey: classMaterialsKey(classId),
       });
     } catch (e) {
-      if (e instanceof ApiError && e.status === 503) {
-        setError("파일 임베딩이 아직 활성화되지 않았습니다(관리자 설정 필요).");
+      if (e instanceof ApiError && isGeminiKeyError(e.code)) {
+        setError(e.message);
       } else {
         setError(`업로드 실패: ${(e as Error).message}`);
       }
@@ -76,6 +84,23 @@ export function MaterialsTab({ classId }: { classId: string }) {
       setUploading(false);
       if (inputRef.current) inputRef.current.value = "";
     }
+  };
+
+  const handleRetry = async (fileId: string) => {
+    setError(null);
+    try {
+      await retryFile(fileId);
+    } catch (e) {
+      if (e instanceof ApiError && isGeminiKeyError(e.code)) {
+        setError(e.message);
+        openGeminiKeyDialog(e.message);
+      } else {
+        setError(`재시도 실패: ${(e as Error).message}`);
+      }
+    }
+    await queryClient.invalidateQueries({
+      queryKey: classMaterialsKey(classId),
+    });
   };
 
   return (
@@ -124,7 +149,11 @@ export function MaterialsTab({ classId }: { classId: string }) {
       ) : (
         <ul className="flex flex-col gap-2">
           {materials.map((f) => (
-            <MaterialItem key={f.id} file={f} />
+            <MaterialItem
+              key={f.id}
+              file={f}
+              onRetry={() => handleRetry(f.id)}
+            />
           ))}
         </ul>
       )}
@@ -132,8 +161,18 @@ export function MaterialsTab({ classId }: { classId: string }) {
   );
 }
 
-function MaterialItem({ file }: { file: FileRow }) {
-  const meta = STATUS_META[file.status];
+function MaterialItem({
+  file,
+  onRetry,
+}: {
+  file: FileRow;
+  onRetry: () => void;
+}) {
+  const meta = STATUS_META[file.status] ?? STATUS_META.uploaded;
+  const hasKey = useHasGeminiKey();
+  const needsKey = file.status === "needs_key";
+  const canRetry =
+    file.status === "failed" || file.status === "partial" || (needsKey && hasKey);
   const total = file.chunk_total ?? 0;
   const done = file.chunk_done ?? 0;
   const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
@@ -177,6 +216,35 @@ function MaterialItem({ file }: { file: FileRow }) {
 
       {(file.status === "failed" || file.status === "partial") && file.error && (
         <p className="mt-1 text-[11px] text-danger">{file.error}</p>
+      )}
+
+      {needsKey && (
+        <p className="mt-1 flex flex-wrap items-center gap-1 text-[11px] text-accent-fg">
+          <KeyRound size={11} className="shrink-0 text-accent-deep" />
+          {file.error === "gemini_key_invalid"
+            ? "API 키가 거부되어 자료 검색(RAG)을 준비하지 못했어요. 키를 확인한 뒤 재시도하세요."
+            : "API 키를 설정하면 자료 검색(RAG)을 쓸 수 있어요. (자료는 저장되어 있어요)"}
+          {!hasKey && (
+            <button
+              type="button"
+              onClick={() => openGeminiKeyDialog()}
+              className="font-medium text-accent-deep underline"
+            >
+              키 입력
+            </button>
+          )}
+        </p>
+      )}
+
+      {canRetry && (
+        <button
+          type="button"
+          onClick={onRetry}
+          className="mt-1.5 flex items-center gap-1 rounded-md border border-warning/50 px-2 py-0.5 text-[11px] font-medium text-warning transition-colors hover:bg-warning/10"
+        >
+          <RotateCcw size={11} />
+          재시도
+        </button>
       )}
     </li>
   );

@@ -305,11 +305,17 @@ export function useHomeSummary() {
   });
 }
 
-/** 홈 질문 추천(3개). */
-export function useHomeSuggestions() {
+/**
+ * 홈 질문 추천(3개). Gemini 키가 필요한 AI 호출이라 키가 있을 때만 요청한다.
+ * 키 유무(불리언, 키 값 자체는 아님)를 queryKey에 넣어 키 입력 직후 다시 불러온다.
+ * 키 오류(400/429 등)는 재시도하지 않는다.
+ */
+export function useHomeSuggestions(hasKey: boolean) {
   return useQuery<HomeSuggestions>({
-    queryKey: ["home", "suggestions"],
+    queryKey: ["home", "suggestions", hasKey],
     queryFn: () => getHomeSuggestions(),
+    enabled: hasKey,
+    retry: false,
   });
 }
 

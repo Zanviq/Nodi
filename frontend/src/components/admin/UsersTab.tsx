@@ -52,7 +52,7 @@ export function UsersTab({ currentUserId }: { currentUserId: string }) {
         <table className="w-full text-sm">
           <thead className="bg-[#221e17] text-left text-xs uppercase text-[#9a948a]">
             <tr>
-              <th className="px-3 py-2">이메일</th>
+              <th className="px-3 py-2">아이디</th>
               <th className="px-3 py-2">이름</th>
               <th className="px-3 py-2">가입일</th>
               <th className="px-3 py-2">권한</th>
@@ -62,7 +62,7 @@ export function UsersTab({ currentUserId }: { currentUserId: string }) {
             {(users ?? []).map((u) => (
               <tr key={u.id} className="border-t border-white/5">
                 <td className="px-3 py-2">
-                  {u.email}
+                  {u.username || u.email || u.id.slice(0, 8)}
                   {u.id === currentUserId && (
                     <span className="ml-1 text-xs text-[#9a948a]">(나)</span>
                   )}
