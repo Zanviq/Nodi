@@ -1,7 +1,8 @@
 """Application settings.
 
-Loads configuration from the repository ROOT `.env` (one level above `backend/`).
-Secrets are never hardcoded — pydantic-settings reads them from env / .env.
+Reads process environment variables first (the Docker container gets them from
+docker-compose), then falls back to the repository ROOT `.env` for local runs.
+Secrets are never hardcoded.
 """
 
 from __future__ import annotations
@@ -17,17 +18,29 @@ ROOT_ENV = REPO_ROOT / ".env"
 
 
 class Settings(BaseSettings):
-    # --- Supabase ---
-    supabase_url: str = ""
-    supabase_project_ref: str = ""
-    # JWKS endpoint used to verify ES256-signed user JWTs.
-    supabase_jwks_url: str = ""
-    supabase_anon_key: str = ""
-    # Optional in Stage 0 — server-side privileged ops. App must boot without it.
-    supabase_service_role_key: str = ""
+    # --- Database (PostgreSQL + pgvector) ---
+    # e.g. postgres://nodi:nodi@db:5432/nodi?sslmode=disable
+    database_url: str = ""
+    db_pool_min_size: int = 1
+    db_pool_max_size: int = 10
+
+    # --- Auth (username + password, session JWT in an httpOnly cookie) ---
+    # HS256 signing secret. Empty -> a random per-process secret is generated
+    # (sessions then do not survive a restart). Set a long random value.
+    jwt_secret: str = ""
+    jwt_expire_days: int = 7
+    session_cookie_name: str = "nodi_session"
+    # Set true when served over HTTPS so the cookie gets the Secure flag.
+    cookie_secure: bool = False
+
+    # --- Local file storage (replaces the hosted object storage) ---
+    storage_dir: str = "/data/uploads"
+    # Seed file bytes copied into storage_dir on startup when missing.
+    seed_uploads_dir: str = ""
 
     # --- AI (Gemini) ---
-    google_gemini_api_key: str = ""
+    # There is NO server-side Gemini key: every AI request carries the user's
+    # own key in the `X-Gemini-Key` header (see app/ai_key.py).
     # Chat model (streaming). Label model is a lighter/cheaper flash variant.
     # Runtime override (admin) lands in a later stage; static config for now.
     gemini_chat_model: str = "gemini-2.5-flash"
@@ -58,26 +71,15 @@ class Settings(BaseSettings):
     memory_answer_char_cap: int = 400
 
     # --- File RAG embeddings (Stage 3b-1) ---
-    # NOTE: text-embedding-004 is unavailable on this API key; gemini-embedding-001
-    # is the current model and supports output_dimensionality (768 here -> the
+    # gemini-embedding-001 supports output_dimensionality (768 here -> the
     # file_chunks.embedding vector(768) column). Reduced dims are not pre-
-    # normalized, so the worker L2-normalizes before storing.
+    # normalized, so the pipeline L2-normalizes before storing.
     gemini_embedding_model: str = "gemini-embedding-001"
     embedding_dimension: int = 768
-    # Chunks per embedding_batch child job; sub-batched per embed request.
-    embedding_batch_size: int = 64
     embedding_request_max_chunks: int = 32  # per embed_content call
-    embedding_worker_concurrency: int = 3  # parallel jobs claimed per poll
-    embedding_worker_poll_seconds: int = 5
-    embedding_max_attempts: int = 3
-    # A 'running' job older than this (no progress) is considered orphaned by a
-    # crashed worker and recovered (requeued while attempts remain, else failed).
-    embedding_stale_seconds: int = 120
     # Text chunking.
     chunk_size_chars: int = 1200
     chunk_overlap_chars: int = 150
-    # Supabase Storage bucket for uploaded files.
-    storage_bucket: str = "files"
     # Upper bound on a single uploaded file (bytes) — guard before processing.
     file_max_bytes: int = 25 * 1024 * 1024
 
@@ -123,9 +125,8 @@ class Settings(BaseSettings):
     file_suggestion_suggest_query_chars: int = 450
 
     # --- App ---
-    # Postgres role embedded in Supabase user JWTs (NOT the app role).
-    jwt_audience: str = "authenticated"
-    cors_origins: list[str] = ["http://localhost:3000"]
+    # Comma-separated list of allowed browser origins (credentials allowed).
+    cors_origins: str = "http://localhost:3000"
     environment: str = "development"
 
     model_config = SettingsConfigDict(
@@ -136,28 +137,8 @@ class Settings(BaseSettings):
     )
 
     @property
-    def jwks_url(self) -> str:
-        """Resolved JWKS URL, derived from SUPABASE_URL if not given explicitly."""
-        if self.supabase_jwks_url:
-            return self.supabase_jwks_url
-        if self.supabase_url:
-            return f"{self.supabase_url.rstrip('/')}/auth/v1/.well-known/jwks.json"
-        return ""
-
-    @property
-    def rest_url(self) -> str:
-        return f"{self.supabase_url.rstrip('/')}/rest/v1" if self.supabase_url else ""
-
-    @property
-    def auth_issuer(self) -> str:
-        """Expected `iss` claim of Supabase-issued user JWTs."""
-        return f"{self.supabase_url.rstrip('/')}/auth/v1" if self.supabase_url else ""
-
-    @property
-    def storage_url(self) -> str:
-        return (
-            f"{self.supabase_url.rstrip('/')}/storage/v1" if self.supabase_url else ""
-        )
+    def cors_origin_list(self) -> list[str]:
+        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
 
 
 @lru_cache

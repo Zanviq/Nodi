@@ -6,8 +6,8 @@ enough to exercise the registry + trace structure. Stage 4 replaces the scripted
 planner with an LLM planner driving a multi-step thought->skill->observation
 loop, plus confirmation_required gates for write-skills.
 
-Tracing is BEST-EFFORT: if the ai_* tables are absent (migration not yet
-applied) or RLS rejects, the run still proceeds — trace failures only log.
+Tracing is BEST-EFFORT: if the ai_* tables are absent or the access layer
+rejects a write, the run still proceeds — trace failures only log.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..services.supabase_client import UserClient
+from ..db.client import UserClient
 from .skills import get_skill
 
 logger = logging.getLogger("nodi.ai.react")
@@ -117,8 +117,8 @@ class ReActRunner:
     ) -> dict[str, Any]:
         """Execute one registered skill, charging the budget and tracing it.
 
-        `ctx` (SkillContext: client + identity) is passed to the skill but kept
-        OUT of the trace payload (no client/token in ai_steps).
+        `ctx` (SkillContext: client + identity + Gemini key) is passed to the
+        skill but kept OUT of the trace payload (no client/key in ai_steps).
         """
         if self.budget.exceeded():
             raise RuntimeError("ReAct budget exceeded")

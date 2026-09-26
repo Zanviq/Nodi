@@ -1,7 +1,7 @@
 """Overseer (총괄 AI) — home, LINEAR context (architecture §7).
 
-Builds a workspace snapshot by calling the read-skills (RLS-scoped, traced via
-the ReActRunner), streams a short navigational reply, and proposes structured
+Builds a workspace snapshot by calling the read-skills (access-checked, traced
+via the ReActRunner), streams a short navigational reply, and proposes structured
 ACTIONS (buttons) the frontend renders:
 
   - {action: "create_session", label, space_kind, space_ref, seed_question}
@@ -22,7 +22,7 @@ from ..ai.react import Budget, ReActRunner
 from ..ai.skills.base import SkillContext
 from ..config import get_settings
 from . import app_settings
-from .supabase_client import UserClient
+from ..db.client import UserClient
 
 logger = logging.getLogger("nodi.overseer")
 settings = get_settings()

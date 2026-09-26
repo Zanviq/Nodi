@@ -8,7 +8,9 @@ reference block ("[연결된 자료에서 참고]") distinct from the live branc
 Stage-3a memory-link block.
 
 Best-effort: any failure -> no RAG context, never blocks the turn. Reads use the
-caller's RLS-scoped client (own files only).
+caller's access-checked client (own files + class materials). The query
+embedding uses the caller's own Gemini key (X-Gemini-Key); without it RAG is
+skipped.
 """
 
 from __future__ import annotations
@@ -18,8 +20,8 @@ import re
 from typing import Any
 
 from ..config import get_settings
+from ..db.client import UserClient
 from . import app_settings, embedding
-from .supabase_client import UserClient
 
 logger = logging.getLogger("nodi.rag")
 settings = get_settings()
@@ -57,17 +59,24 @@ async def linked_file_ids(
 
 
 async def search(
-    client: UserClient, file_ids: list[str], query: str, k: int | None = None
+    client: UserClient,
+    file_ids: list[str],
+    query: str,
+    k: int | None = None,
+    *,
+    api_key: str | None,
 ) -> list[dict[str, Any]]:
     """Cosine top-K chunks from the given (owned) files for the query."""
-    if not file_ids or not query.strip():
+    if not file_ids or not query.strip() or not api_key:
         return []
     if k is None:
         # RAG-injection path (suggest_files passes its own search_k). D62: the
         # admin-tunable rag_top_k overrides the config default.
         overlay = await app_settings.get_overlay()
         k = app_settings.as_int(overlay, "rag_top_k", settings.rag_top_k, 1, 50)
-    vec = await embedding.embed_texts([query], task_type="RETRIEVAL_QUERY")
+    vec = await embedding.embed_texts(
+        [query], api_key=api_key, task_type="RETRIEVAL_QUERY"
+    )
     if not vec:
         return []
     result = await client.rpc(
@@ -164,7 +173,10 @@ async def _file_names(
 
 
 async def build_rag_context(
-    client: UserClient, chain: list[dict[str, Any]], query: str
+    client: UserClient,
+    chain: list[dict[str, Any]],
+    query: str,
+    api_key: str | None,
 ) -> dict[str, Any] | None:
     """Best-effort: assemble the linked-file reference block + source metadata.
 
@@ -172,11 +184,13 @@ async def build_rag_context(
     snippet} ]}`` or ``None`` when there is nothing to inject. Callers use
     ``block`` for the system prompt and ``sources`` for node/log provenance (D32).
     """
+    if not api_key:
+        return None
     try:
         file_ids = await linked_file_ids(client, chain)
         if not file_ids:
             return None
-        chunks = await search(client, file_ids, query)
+        chunks = await search(client, file_ids, query, api_key=api_key)
         if not chunks:
             return None
         hit_ids = list({c.get("file_id") for c in chunks if c.get("file_id")})
@@ -324,13 +338,17 @@ async def suggest_files(
     chain: list[dict[str, Any]],
     space_kind: str,
     space_ref: str,
+    api_key: str | None,
 ) -> list[dict[str, Any]]:
     """Propose files to link when the current branch has NONE linked yet.
 
     Returns top-N files (grouped by best chunk distance) with a sample chunk.
     Empty if the branch already has linked files or the space has no indexed
-    files. Best-effort.
+    files. Best-effort. Without a Gemini key (needed for the query embedding)
+    there is nothing to compare against -> [].
     """
+    if not api_key:
+        return []
     try:
         # D62/D63: resolve the suggestion gate from the admin overlay (falling
         # back to config). All knobs read here so an admin slider change takes
@@ -342,7 +360,7 @@ async def suggest_files(
         # Already has linked files on this branch -> no suggestion.
         if await linked_file_ids(client, chain):
             return []
-        # Indexed files available in this space (own + class_material via RLS).
+        # Indexed files available in this space (own + class_material, access layer).
         files = await client.select(
             "files",
             {
@@ -391,7 +409,9 @@ async def suggest_files(
             1,
             100,
         )
-        chunks = await search(client, list(by_id), query, k=search_k)
+        chunks = await search(
+            client, list(by_id), query, k=search_k, api_key=api_key
+        )
         # Group chunks by file, keep best (smallest) distance + a sample.
         best: dict[str, dict[str, Any]] = {}
         for c in chunks:

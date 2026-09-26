@@ -8,11 +8,12 @@ from typing import Any
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
 
+from ..ai_key import optional_gemini_key
 from ..auth.deps import CurrentUser, get_current_user
 from ..services import files as files_svc
 from ..services import rag
 from ..services import sessions as svc
-from ..services.supabase_client import UserClient
+from ..db.client import UserClient
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
 
@@ -119,7 +120,10 @@ async def set_node_positions(
     body: NodePositionsBody,
     user: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
-    """Batch-persist node coordinates after drag/relayout (D20)."""
+    """Batch-persist node coordinates after drag/relayout (D20/D69).
+
+    One bulk statement; only the caller's own nodes in this session are
+    updated. Non-uuid (client-only) ids are skipped silently."""
     client = UserClient.from_user(user)
     n = await svc.set_node_positions(
         client, session_id, [p.model_dump() for p in body.positions]
@@ -134,7 +138,7 @@ async def get_session_file_links(
 ) -> list[dict[str, Any]]:
     """Files linked to any node in this session (for graph file-nodes + edges)."""
     client = UserClient.from_user(user)
-    await svc.get_session(client, session_id)  # 404/RLS gate
+    await svc.get_session(client, session_id)  # 404/access gate
     return await files_svc.list_session_file_links(client, session_id)
 
 
@@ -150,7 +154,7 @@ async def list_file_graph_nodes(
     files.session_id filter). Independent of RAG links.
     """
     client = UserClient.from_user(user)
-    await svc.get_session(client, session_id)  # 404/RLS gate
+    await svc.get_session(client, session_id)  # 404/access gate
     return await files_svc.list_placements(client, session_id)
 
 
@@ -200,9 +204,15 @@ async def get_file_suggestions(
     session_id: str,
     node_id: str | None = Query(None),
     user: CurrentUser = Depends(get_current_user),
+    api_key: str | None = Depends(optional_gemini_key),
 ) -> dict[str, Any]:
     """When the current branch has no linked files, propose space files to link
-    (embedding match). Empty if files are already linked or none indexed."""
+    (embedding match). Empty if files are already linked or none indexed.
+
+    Needs the caller's Gemini key for the query embedding; without it the
+    answer is `{"suggestions": [], "ai_unavailable": true}` (not an error)."""
+    if not api_key:
+        return {"suggestions": [], "ai_unavailable": True}
     client = UserClient.from_user(user)
     # Session meta and the node list are independent reads -> fetch concurrently.
     # Only `head`/`chain` depend on the session (current_head_id), so they stay
@@ -214,6 +224,6 @@ async def get_file_suggestions(
     head = node_id or session.get("current_head_id")
     chain = svc.ancestor_chain_nodes(nodes, head)
     suggestions = await rag.suggest_files(
-        client, chain, session.get("space_kind"), session.get("space_ref")
+        client, chain, session.get("space_kind"), session.get("space_ref"), api_key
     )
     return {"suggestions": suggestions}

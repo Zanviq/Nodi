@@ -1,1 +1,1 @@
-"""Service layer: Supabase access, Gemini, conversation/session logic."""
+"""Service layer: database access helpers, Gemini, conversation/session logic, files."""

@@ -6,8 +6,8 @@
 
 Connections power "node memory linking": a node's `connections uuid[]` lists
 other-branch nodes pulled into it; chat context assembly LCA-trims and injects
-them as reference (see services/memory.py). All writes are owner-only (RLS +
-the add/remove RPCs in migration 0007).
+them as reference (see services/memory.py). All writes are owner-only (access
+layer + the ownership checks inside the add/remove RPCs).
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
 from ..auth.deps import CurrentUser, get_current_user
-from ..services.supabase_client import UserClient
+from ..db.client import UserClient
 
 router = APIRouter(prefix="/nodes", tags=["nodes"])
 
@@ -48,7 +48,7 @@ async def delete_node(
         {"id": f"eq.{node_id}", "select": "id,is_navigator", "limit": "1"},
     )
     if not rows:
-        # Either it does not exist or RLS hid it (not the caller's session).
+        # Either it does not exist or the access layer hid it (not accessible).
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Node not found.",
@@ -58,7 +58,7 @@ async def delete_node(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only navigator nodes can be deleted via this endpoint.",
         )
-    # RLS (nodes_delete_owner) still enforces ownership at the DB layer.
+    # The nodes delete rule still enforces ownership (session owner only).
     await client.delete("nodes", {"id": f"eq.{node_id}"})
 
 
@@ -68,7 +68,7 @@ async def set_node_position(
     body: PositionBody,
     user: CurrentUser = Depends(get_current_user),
 ) -> dict:
-    """Persist a single node's coordinates (D20). Owner only (RLS)."""
+    """Persist a single node's coordinates (D20). Owner only (access layer)."""
     client = UserClient.from_user(user)
     rows = await client.update(
         "nodes",

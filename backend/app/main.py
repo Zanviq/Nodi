@@ -1,19 +1,25 @@
-"""nodi FastAPI application (Stage 0 foundation).
+"""nodi FastAPI application.
 
-Boots with only config + auth (JWKS) + health/me routers. Real chat/RAG/skills
-land in later stages. Must boot even when SUPABASE_SERVICE_ROLE_KEY is empty.
+Self-hosted stack: PostgreSQL (+pgvector) via a shared asyncpg pool, username +
+password auth with an httpOnly session cookie, local file storage, and Gemini
+called with each user's own key (`X-Gemini-Key`). Routes are mounted at the
+root (the frontend reaches them through its same-origin `/api/*` rewrite).
 """
 
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from .ai_key import KeyRedactingFilter
 from .config import get_settings
+from .db.pool import close_pool, init_pool
 from .routers import (
     admin,
+    auth,
     chat,
     files,
     health,
@@ -25,42 +31,54 @@ from .routers import (
     tags,
     teacher,
 )
-from .services import embedding_worker
-from .services.service_client import aclose_service_http
-from .services.supabase_client import aclose_shared_client
+from .services import storage
 
 settings = get_settings()
 
 
+def _configure_logging() -> None:
+    root = logging.getLogger()
+    if not root.handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        )
+    # Defense in depth: never let a user's Gemini key reach a log line.
+    for logger_name in ("", "uvicorn", "uvicorn.error", "uvicorn.access"):
+        for handler in logging.getLogger(logger_name).handlers:
+            if not any(isinstance(f, KeyRedactingFilter) for f in handler.filters):
+                handler.addFilter(KeyRedactingFilter())
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    # Startup: embedding worker (no-op if SUPABASE_SERVICE_ROLE_KEY is unset).
-    # The shared PostgREST connection pools (D65, user + worker) are created
-    # lazily on first use.
-    embedding_worker.start(_app)
+    _configure_logging()
+    try:
+        storage.copy_seed_uploads()
+    except Exception:  # noqa: BLE001 - seed files are optional
+        logging.getLogger("nodi").exception("Copying seed uploads failed")
+    await init_pool()
     yield
-    # Shutdown: stop the scheduler + close both shared httpx connection pools.
-    embedding_worker.stop()
-    await aclose_shared_client()
-    await aclose_service_http()
+    await close_pool()
 
 
 app = FastAPI(
     title="nodi backend",
-    version="0.1.0",
-    description="AI conversation visualized as a node/tree. Stage 1 chat core.",
+    version="0.2.0",
+    description="AI conversation visualized as a node/tree.",
     lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins,
+    allow_origins=settings.cors_origin_list,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 app.include_router(health.router)
+app.include_router(auth.router)
 app.include_router(me.router)
 app.include_router(sessions.router)
 app.include_router(tags.router)
@@ -75,4 +93,4 @@ app.include_router(teacher.router)
 
 @app.get("/", tags=["health"])
 async def root() -> dict:
-    return {"service": "nodi-backend", "version": "0.1.0", "docs": "/docs"}
+    return {"service": "nodi-backend", "version": "0.2.0", "docs": "/docs"}

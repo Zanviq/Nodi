@@ -1,8 +1,7 @@
 """Admin console endpoints (Stage 4c) — all admin-only.
 
-Uses the admin's OWN JWT against the admin RLS policies / SECURITY DEFINER RPCs
-added in migration 0008 (no service_role). Job monitor + file/storage usage are
-deferred to Stage 3b.
+Runs as the admin's own identity: the access layer's admin read rules and the
+admin RPCs (admin_set_user_role / admin_token_usage) re-check is_admin().
 """
 
 from __future__ import annotations
@@ -15,8 +14,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
 from ..auth.deps import CurrentUser, Profile, get_current_user, require_admin
+from ..db.client import UserClient, get_service_client
 from ..services import app_settings
-from ..services.supabase_client import UserClient
 
 logger = logging.getLogger("nodi.admin")
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -31,13 +30,24 @@ async def list_users(
     _: Profile = Depends(require_admin),
 ) -> list[dict[str, Any]]:
     client = UserClient.from_user(user)
-    return await client.select(
+    rows = await client.select(
         "profiles",
         {
             "select": "id,email,role,display_name,avatar_url,created_at",
             "order": "created_at.desc",
         },
     )
+    # Login names live in `users` (not user-readable); attach them for the
+    # caller-verified admin.
+    names = {
+        r["id"]: r["username"]
+        for r in await get_service_client().fetch(
+            "select id::text as id, username from public.users"
+        )
+    }
+    for r in rows:
+        r["username"] = names.get(r.get("id"))
+    return rows
 
 
 class RoleBody(BaseModel):
@@ -94,7 +104,7 @@ async def put_setting(
     The value lands in app_settings AND, because every tunable call site now
     reads through the app_settings overlay (services/app_settings.py), takes
     LIVE effect — instantly in this process via bust_cache(), within the TTL
-    elsewhere. (Danger keys like embedding_dimension are guarded at the worker.)
+    elsewhere. (Danger keys like embedding_dimension are guarded in the file pipeline.)
     """
     client = UserClient.from_user(user)
     result = await client.upsert(
@@ -138,11 +148,27 @@ async def token_usage(
 # ---------------------------------------------------------------------------
 # Logs — chat turn browser (ai_logs, D25) + ReAct step traces (ai_sessions)
 # ---------------------------------------------------------------------------
+def _iso_or_422(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).isoformat()
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invalid timestamp.",
+        ) from None
+
+
 @router.get("/logs")
 async def list_logs(
     user_id: str | None = Query(None),
     since: str | None = Query(None, description="ISO timestamp (created_at >=)"),
     until: str | None = Query(None, description="ISO timestamp (created_at <)"),
+    after: str | None = Query(
+        None,
+        description="ISO timestamp (created_at > after) — polling for new turns",
+    ),
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     user: CurrentUser = Depends(get_current_user),
@@ -150,8 +176,10 @@ async def list_logs(
 ) -> dict[str, Any]:
     """Chat turn logs (`ai_logs`): system prompt, Q/A, used contexts, skill
     calls, errors, token estimate. user/date filters + pagination, newest first.
-    The frontend live-appends new turns via Supabase Realtime and pages history
-    through this endpoint."""
+
+    Live view = polling: call with `after=<created_at of the newest row you
+    have>` every few seconds; only strictly newer turns come back (newest
+    first). `since`/`until` remain the inclusive/exclusive range filters."""
     client = UserClient.from_user(user)
     params: dict[str, str] = {
         "select": (
@@ -162,13 +190,21 @@ async def list_logs(
         "limit": str(limit),
         "offset": str(offset),
     }
+    # These values are spliced into filter strings (and=(...)), so accept only
+    # real ISO timestamps — a raw value could otherwise append extra conditions.
+    since, until, after = (_iso_or_422(v) for v in (since, until, after))
     if user_id:
         params["owner_id"] = f"eq.{user_id}"
     if since:
         params["created_at"] = f"gte.{since}"
+    extra: list[str] = []
     if until:
-        # combine with `since` when both present
-        params["and"] = f"(created_at.lt.{until})"
+        extra.append(f"created_at.lt.{until}")
+    if after:
+        extra.append(f"created_at.gt.{after}")
+    if extra:
+        # combined with `since` when present
+        params["and"] = f"({','.join(extra)})"
     logs = await client.select("ai_logs", params)
     return {"limit": limit, "offset": offset, "logs": logs}
 
@@ -177,11 +213,9 @@ _LOG_SELECT = (
     "id,owner_id,session_id,node_id,kind,system_prompt,question,answer,"
     "contexts,skill_calls,errors,token_estimate,created_at"
 )
-# D42: two SIMPLE selects (no PostgREST embed / embed-ordering) then assemble in
-# Python. The old embed `ai_steps(...)` + `ai_steps.order=seq.asc` was the only
-# place that resource-embedding/embedded-ordering ran, and when PostgREST failed
-# to resolve it (schema-cache / relationship), the whole turn-detail 502'd —
-# blocking the CORE log over a secondary trace. Plain queries are robust.
+# D42: two SIMPLE selects (no embed / embed-ordering) then assemble in Python,
+# so a secondary trace problem can never block the CORE log. Plain queries are
+# robust.
 _SESSION_SELECT = "id,owner_id,session_id,kind,created_at"
 _STEP_SELECT = (
     "ai_session_id,seq,thought,skill,input,observation,tokens,created_at"
@@ -199,7 +233,7 @@ async def _fetch_session_traces(
     """ReAct traces assembled from two plain queries (no embed): ai_sessions,
     then ai_steps (in.(session ids), seq.asc), grouped in Python. Returns each
     session row with an attached `ai_steps` list — the shape the frontend's
-    embedded form produced — without depending on PostgREST embedding."""
+    embedded form produced — without depending on embedded selects."""
     params: dict[str, str] = {
         "select": _SESSION_SELECT,
         "order": "created_at.desc",
@@ -246,7 +280,7 @@ async def get_log_detail(
     """D34 turn detail: one `ai_logs` turn (structured contexts incl. RAG
     sources + prompt spans) bundled with the ReAct traces (`ai_sessions` +
     `ai_steps`) of the SAME session, so the admin sees how a turn was built and
-    which navigator/overseer steps ran. Admin-only (require_admin + admin RLS).
+    which navigator/overseer steps ran. Admin-only (require_admin + admin rules).
 
     D42: the CORE log is always returned when it exists; trace assembly is
     isolated in try/except so a secondary-data failure can never block the turn
@@ -288,7 +322,7 @@ async def list_traces(
 ) -> dict[str, Any]:
     """ReAct step traces (`ai_sessions` + `ai_steps`) for navigator/overseer
     runs. Filter by user and/or session (the latter powers the D34 turn-detail
-    timeline). Assembled from two plain queries (D42) — no PostgREST embed."""
+    timeline). Assembled from two plain queries (D42) — no embedded select."""
     client = UserClient.from_user(user)
     sessions = await _fetch_session_traces(
         client,

@@ -6,15 +6,16 @@ runtime historically read ONLY `config.py`, so admin edits had no live effect
 call site resolves its value as **per-request override > app_settings overlay >
 config default**.
 
-`get_overlay()` returns `{key: value}` for all rows via the service-role client
-(app_settings is admin-RLS, so a user JWT can't read it — same reason me.py uses
-the service client). A short TTL cache avoids a DB read every chat turn; admin
-PUTs call `bust_cache()` for same-process instant reflection (multi-process /
-serverless reflect within the TTL).
+`get_overlay()` returns `{key: value}` for all rows via the trusted system
+client (app_settings is admin-only for user clients, so a normal caller can't
+read it). A short TTL cache avoids a DB read every chat turn; admin PUTs call
+`bust_cache()` for same-process instant reflection (multi-process reflects
+within the TTL). The cache holds only these global tuning values — nothing
+user- or key-specific.
 
-Best-effort by contract: a missing service key or a failed read returns `{}`,
-and the typed accessors fall back to the caller-supplied config default — this
-module NEVER raises, so it can sit on the hot chat path without risking a 502.
+Best-effort by contract: a failed read returns `{}`, and the typed accessors
+fall back to the caller-supplied config default — this module NEVER raises, so
+it can sit on the hot chat path without risking a 502.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ import logging
 import time
 from typing import Any
 
-from .service_client import get_service_client
+from ..db.client import get_service_client
 
 logger = logging.getLogger("nodi.app_settings")
 
@@ -38,16 +39,14 @@ _loaded_at = 0.0
 async def get_overlay() -> dict[str, Any]:
     """All app_settings as a `{key: jsonb_value}` dict (cached, best-effort).
 
-    Returns `{}` when the service key is absent or the read fails, so callers
-    transparently fall back to config defaults. Never raises.
+    Returns `{}` when the read fails, so callers transparently fall back to
+    config defaults. Never raises.
     """
     global _cache, _loaded_at
     now = time.monotonic()
     if _cache and (now - _loaded_at) < _TTL:
         return _cache
     svc = get_service_client()
-    if svc is None:
-        return {}  # graceful: callers fall back to config defaults
     try:
         rows = await svc.select("app_settings", {"select": "key,value"})
         _cache = {r["key"]: r.get("value") for r in rows if r.get("key")}
@@ -66,7 +65,7 @@ def bust_cache() -> None:
 
 # ---------------------------------------------------------------------------
 # Typed accessors — jsonb value -> python, with config fallback + clamp.
-# app_settings values are jsonb, so PostgREST already deserializes them to
+# app_settings values are jsonb, so the DB layer already deserializes them to
 # native python (str/int/float/bool). These coerce defensively and clamp tuning
 # values into an admin-safe range so a bad edit can't push the runtime out of
 # bounds.

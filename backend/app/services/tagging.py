@@ -18,9 +18,9 @@ import unicodedata
 from google.genai import types
 
 from ..config import get_settings
+from ..db.client import UserClient
 from . import app_settings
-from .gemini import get_client
-from .supabase_client import UserClient
+from .gemini import ai_session
 
 logger = logging.getLogger("nodi.tagging")
 settings = get_settings()
@@ -54,7 +54,7 @@ def _norm_key(name: str) -> str:
 def _parse_tags(raw: str, max_tags: int) -> list[str]:
     """Parse the model's JSON array into a clean, deduped, capped list.
 
-    Dedup uses the same normalization as the DB (`nodi_norm_tag`), so表기 variants
+    Dedup uses the same normalization as the DB (`nodi_norm_tag`), so 표기 variants
     ("Python" / "python" / "파이썬 ") collapse to one within a single response —
     complementing the DB-side norm_name reuse in upsert_*_tags (D30)."""
     text = (raw or "").strip()
@@ -86,7 +86,9 @@ def _parse_tags(raw: str, max_tags: int) -> list[str]:
     return out
 
 
-async def extract_concepts(question: str, answer: str) -> list[str]:
+async def extract_concepts(
+    question: str, answer: str, api_key: str | None
+) -> list[str]:
     """Return 1..max_tags concept strings (empty list on any failure)."""
     overlay = await app_settings.get_overlay()
     max_tags = app_settings.as_int(
@@ -96,16 +98,18 @@ async def extract_concepts(question: str, answer: str) -> list[str]:
         max_tags=max_tags, question=question, answer=answer
     )
     try:
-        client = get_client()
-        resp = await client.aio.models.generate_content(
-            model=app_settings.as_str(overlay, "tag_model", settings.gemini_tag_model),
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                max_output_tokens=120,
-                temperature=0.2,
-            ),
-        )
+        async with ai_session(api_key) as aio:
+            resp = await aio.models.generate_content(
+                model=app_settings.as_str(
+                    overlay, "tag_model", settings.gemini_tag_model
+                ),
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    max_output_tokens=120,
+                    temperature=0.2,
+                ),
+            )
         return _parse_tags(resp.text or "", max_tags)
     except Exception as exc:  # noqa: BLE001 - tagging must never break chat
         logger.warning("Concept extraction failed: %s", exc)
@@ -124,7 +128,7 @@ _FILE_TAG_PROMPT = (
 )
 
 
-async def extract_file_concepts(text: str) -> list[str]:
+async def extract_file_concepts(text: str, api_key: str | None) -> list[str]:
     """Extract up to file_tag_max concept strings from file text (best-effort)."""
     max_tags = settings.file_tag_max
     excerpt = (text or "").strip()[: settings.file_tag_sample_chars]
@@ -132,17 +136,19 @@ async def extract_file_concepts(text: str) -> list[str]:
         return []
     prompt = _FILE_TAG_PROMPT.format(max_tags=max_tags, text=excerpt)
     try:
-        client = get_client()
         overlay = await app_settings.get_overlay()
-        resp = await client.aio.models.generate_content(
-            model=app_settings.as_str(overlay, "tag_model", settings.gemini_tag_model),
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                max_output_tokens=1000,
-                temperature=0.3,
-            ),
-        )
+        async with ai_session(api_key) as aio:
+            resp = await aio.models.generate_content(
+                model=app_settings.as_str(
+                    overlay, "tag_model", settings.gemini_tag_model
+                ),
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    max_output_tokens=1000,
+                    temperature=0.3,
+                ),
+            )
         return _parse_tags(resp.text or "", max_tags)
     except Exception as exc:  # noqa: BLE001 - tagging must never break indexing
         logger.warning("File concept extraction failed: %s", exc)
@@ -166,11 +172,16 @@ async def apply_node_tags(
 
 
 async def tag_node(
-    client: UserClient, node_id: str, session_id: str, question: str, answer: str
+    client: UserClient,
+    node_id: str,
+    session_id: str,
+    question: str,
+    answer: str,
+    api_key: str | None,
 ) -> list[str]:
     """Full best-effort pipeline: extract -> upsert/link. Never raises."""
     try:
-        names = await extract_concepts(question, answer)
+        names = await extract_concepts(question, answer, api_key)
         return await apply_node_tags(client, node_id, session_id, names)
     except Exception:  # noqa: BLE001
         logger.exception("Tagging failed for node=%s", node_id)

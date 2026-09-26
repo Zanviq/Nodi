@@ -1,6 +1,6 @@
 """Tag endpoints — concept list + co-occurrence (concept page material).
 
-All scoped to the caller's own tags in a space (RLS + explicit owner filters).
+All scoped to the caller's own tags in a space (access layer + owner filters).
 personal: space_ref defaults to the caller's own id (mirrors sessions).
 """
 
@@ -11,7 +11,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from ..auth.deps import CurrentUser, get_current_user
-from ..services.supabase_client import UserClient
+from ..db.client import UserClient
 
 router = APIRouter(prefix="/tags", tags=["tags"])
 

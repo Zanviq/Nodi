@@ -1,8 +1,9 @@
 """File endpoints (Stage 3b-1) — upload + list + status.
 
-Upload requires the service-role client (storage write + the embedding pipeline
-need it). If SUPABASE_SERVICE_ROLE_KEY is unset, upload returns 503; list/get
-still work (RLS reads via the caller's JWT).
+Upload stores the bytes locally and processes the file INLINE (text extraction,
+chunking and — when the caller sends `X-Gemini-Key` — embeddings + concept
+tags). Without a key the file ends in status 'needs_key' (stored and chunked,
+not yet searchable); POST /files/{id}/retry with a key finishes it.
 """
 
 from __future__ import annotations
@@ -21,12 +22,12 @@ from fastapi import (
 )
 from pydantic import BaseModel
 
+from ..ai_key import optional_gemini_key, require_gemini_key
 from ..auth.deps import CurrentUser, get_current_user
 from ..config import get_settings
+from ..db.client import UserClient, get_service_client
 from ..services import app_settings
 from ..services import files as svc
-from ..services.service_client import get_service_client
-from ..services.supabase_client import UserClient
 
 router = APIRouter(prefix="/files", tags=["files"])
 settings = get_settings()
@@ -51,19 +52,17 @@ async def upload(
     position_y: float | None = Form(None),
     kind: str = Form("user_upload"),
     user: CurrentUser = Depends(get_current_user),
+    api_key: str | None = Depends(optional_gemini_key),
 ) -> dict[str, Any]:
-    """Upload a file -> Storage + files row + queued embedding_split job.
+    """Upload a file -> local storage + files row + inline processing.
 
+    Returns the final file row: status 'indexed' (with key), 'needs_key'
+    (no key: RAG unavailable until retried with a key), 'failed'/'partial'.
     Optional `session_id` + `position_x/y` place the file as a node in a session
     graph (D13). `kind='class_material'` (teacher only, space_kind='class') makes
     the file readable + RAG-searchable by all class members (Stage 4b).
     """
     service = get_service_client()
-    if service is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="File uploads are disabled (service-role key not configured).",
-        )
     # Early reject on declared size (avoid buffering an oversized body). D62:
     # the limit is admin-tunable via the overlay (upload_file re-checks it too).
     overlay = await app_settings.get_overlay()
@@ -89,6 +88,7 @@ async def upload(
         position_x=position_x,
         position_y=position_y,
         kind=kind,
+        api_key=api_key,
     )
 
 
@@ -133,32 +133,28 @@ async def delete_file(
     file_id: str,
     user: CurrentUser = Depends(get_current_user),
 ) -> None:
-    """Delete a file (owner only): Storage object + row (cascades chunks/links/tags)."""
-    service = get_service_client()
-    if service is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="File operations are disabled (service-role key not configured).",
-        )
+    """Delete a file (owner only): row (cascades chunks/links/tags) + stored bytes."""
     client = UserClient.from_user(user)
-    await svc.delete_file(service, client, user.id, file_id)
+    await svc.delete_file(client, user.id, file_id)
 
 
 @router.post("/{file_id}/retry")
 async def retry_file(
     file_id: str,
     user: CurrentUser = Depends(get_current_user),
+    api_key: str = Depends(require_gemini_key),
 ) -> dict[str, Any]:
-    """Re-process a failed/partial/stuck file (owner only). Idempotent."""
+    """Re-process a failed/partial/needs_key file (owner only), inline, with the
+    caller's Gemini key (400 `gemini_key_required` without it). Idempotent.
+    Returns {file_id, action, file} where `file` is the updated row."""
     service = get_service_client()
-    if service is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="File operations are disabled (service-role key not configured).",
-        )
     client = UserClient.from_user(user)
-    action = await svc.retry_file(service, client, user.id, file_id)
-    return {"file_id": file_id, "action": action}
+    action = await svc.retry_file(service, client, user.id, file_id, api_key)
+    return {
+        "file_id": file_id,
+        "action": action,
+        "file": await svc.get_file(client, file_id),
+    }
 
 
 @router.patch("/{file_id}/position")
@@ -183,7 +179,7 @@ async def get_chunk_context(
 ) -> dict[str, Any]:
     """Full text + neighbours of a RAG source chunk (the "⋯" detail panel, D41).
 
-    Calls the get_chunk_context RPC under the caller's JWT; visibility (own file
+    Calls the get_chunk_context RPC as the caller; visibility (own file
     or class_material the caller belongs to) is enforced inside the RPC, so a
     chunk the caller cannot access yields 0 rows -> 404. Returns
     ``{file_id, name, seq, page, chunk_text, prev_text, next_text}``.

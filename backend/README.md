@@ -1,123 +1,79 @@
-# nodi backend (Stage 0)
+# nodi backend
 
-FastAPI + Supabase. Stage 0 scope: app skeleton, config, JWT/JWKS auth, role
-guards, and the first migration SQL. No chat/RAG/skills yet.
+FastAPI + PostgreSQL 16 (pgvector). Username/password accounts with an httpOnly
+session cookie, local file storage, and Gemini called with **each user's own
+API key** (sent per request in the `X-Gemini-Key` header — the server stores no
+AI key).
 
-## Setup (Windows / PowerShell)
+## Run with Docker (recommended)
 
-```powershell
-cd backend
-py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+From the repository root:
+
+```bash
+cp .env.example .env
+docker compose up -d --build db migrate backend
 ```
 
-Config is read from the **repository root `.env`** (gitignored). See
-`backend/.env.example` for the expected keys.
+- `db` — `pgvector/pgvector:pg16` (volume `db-data`)
+- `migrate` — dbmate: applies `db/migrations/*` (table `schema_migrations`),
+  then the one-time demo seed `db/seed/*` (table `seed_migrations`)
+- `backend` — this app on `http://localhost:8000` (`/docs` for OpenAPI);
+  uploads live in the `uploads` volume
 
-## Run
+Demo accounts (seeded): `demo` / `teacher` / `admin`, password `demo1234`.
 
-```powershell
+## Run locally (without Docker)
+
+```bash
+cd backend
+python -m venv .venv && . .venv/bin/activate   # Windows: .venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+export DATABASE_URL=postgres://nodi:nodi@localhost:5432/nodi?sslmode=disable
+export STORAGE_DIR=./.data/uploads
 uvicorn app.main:app --reload --port 8000
 ```
 
-- `GET /health` — liveness + which integrations are configured
-- `GET /auth/me` — caller's profile incl. `onboarded` (Bearer JWT)
-- `GET /auth/me/scopes` — personal + class scopes
-- `POST /auth/complete-onboarding` — mark onboarding done (D18, via RPC)
-- `POST /sessions` — create a conversation session
-- `GET /sessions?space_kind=&space_ref=` — sessions in a space (recent first)
-- `GET /sessions/{id}` — session + all nodes (tree restore)
-- `PATCH /sessions/{id}` {title} — rename · `DELETE /sessions/{id}` — delete (D17)
-- `PUT /sessions/{id}/node-positions` {positions:[{node_id,x,y}]} — persist coords (D20)
-- `POST /chat/stream` — Gemini SSE chat; persists (Q+A)=1 node, auto-labels,
-  auto-tags (inline in `done`), and may emit a `navigator` event. Optional
-  `reference_node_ids` injects a one-time "[브랜치 참조]" comparison block (D15,
-  not persisted)
-- `GET /tags?space_kind=&space_ref=` — own concept tags in a space (most-used)
-- `GET /tags/cooccurrence?space_kind=&space_ref=` — co-attached tag pairs
-- `DELETE /nodes/{id}` — delete a waiting navigator node (cleanup after click)
-- `PATCH /nodes/{id}/position` {position_x,position_y} — persist node coords (D20)
-- `POST /nodes/{id}/connections` — memory-link another owned branch node in
-- `DELETE /nodes/{id}/connections/{src}` — remove a memory link
-- `GET /home/summary` — spaces + recent sessions + top personal concepts
-- `GET /home/suggestions` — 3 starter questions (click -> new personal session)
-- `POST /overseer/stream` — overseer (home) SSE; `done` carries action buttons
+Settings come from environment variables first, then the repository-root
+`.env` (see `.env.example`).
 
-Admin (all require app role `admin`; admin RLS / RPCs in migration 0008):
-- `GET /admin/users` · `POST /admin/users/{id}/role` (role change via RPC)
-- `GET /admin/settings` · `PUT /admin/settings/{key}` (runtime app_settings)
-- `GET /admin/usage` (per-user token totals — PARTIAL: skill-step tokens only)
-- `GET /admin/logs?user_id=&since=&until=&limit=&offset=` — chat turn logs
-  (`ai_logs`, D25: system prompt, Q/A, used contexts, skills, errors, tokens).
-  Frontend live-appends new turns via Supabase Realtime on `ai_logs`.
-- `GET /admin/traces?user_id=&limit=&offset=` — ReAct step traces
-  (`ai_sessions` + `ai_steps`) for navigator/overseer
+## Layout
 
-Files / RAG (Stage 3b-1; needs `SUPABASE_SERVICE_ROLE_KEY` for upload+worker):
-- `POST /files` (multipart: file, space_kind, space_ref?, session_id?,
-  position_x?, position_y?, kind?) — Storage + files row + queued
-  `embedding_split` job. 503 if no service-role key. `kind='class_material'`
-  (teacher only, space_kind='class') shares the file with all class members.
-  Images (image/*) are OCR'd via the multimodal model in the worker (Stage 3b-3).
-- `GET /files?space_kind=&space_ref=` — list (status, chunk_done/chunk_total)
-- `GET /files/{id}` — file status + progress · `GET /files/{id}/tags` — tag names
-- `DELETE /files/{id}` — delete (owner; Storage + row cascade)
-- `POST /files/{id}/retry` — re-process a failed/partial/stuck file (owner)
-- `PATCH /files/{id}/position` {position_x,position_y} — file-node coords (D13)
-- `POST /files/{id}/links` {target_node_id} — link a file to a branch (visual RAG)
-- `DELETE /files/{id}/links/{node_id}` — unlink
-- `GET /sessions/{id}/file-links` — files linked in a session (graph file-nodes)
-- `GET /sessions/{id}/file-suggestions?node_id=` — when the branch has no linked
-  files, propose space files to link (embedding match); empty otherwise
+- `app/db/` — asyncpg pool, schema catalog, a translator for the PostgREST-style
+  query params the services use (`postgrest.py`), and the **access layer**
+  (`access.py`) that enforces every per-table permission rule (who may read /
+  insert / update / delete which rows). `UserClient` runs as the caller;
+  `ServiceClient` is the trusted system client.
+- `app/auth/` — bcrypt password hashing, session JWT (HS256) in the
+  `nodi_session` cookie, role guards.
+- `app/ai_key.py` — the `X-Gemini-Key` header dependency, error codes
+  (`gemini_key_required` / `gemini_key_invalid` / `gemini_quota_exceeded`) and a
+  log filter that redacts the key.
+- `app/services/file_pipeline.py` — text extraction (PDF/text, image OCR with a
+  key), chunking, embeddings (`gemini-embedding-001`, 768-d, L2-normalized) and
+  file tagging, run inside the upload/retry request.
+- `app/services/storage.py` — local storage under `STORAGE_DIR`
+  (`{owner_id}/{file_id}/{name}`, path-traversal guarded).
 
-Teacher (Stage 4b; app role `teacher`; RPCs/RLS in migration 0012):
-- `GET /teacher/classes` — classes I teach + student counts
-- `GET /teacher/classes/{id}/students` — students of a class I teach
-- `GET /teacher/classes/{id}/students/{user_id}/sessions` — a student's
-  class-scope sessions (open nodes via `GET /sessions/{id}`)
-- `GET /teacher/classes/{id}/materials` — class materials + embedding status
-- Materials are uploaded via `POST /files` (kind=class_material). Teachers have
-  no chat workspace — there is no teacher chat endpoint.
+## Endpoints (summary)
 
-All request-time DB access uses the caller's JWT (RLS). The background embedding
-worker (`services/embedding_worker.py`, apscheduler) uses the SERVICE-ROLE client
-(`services/service_client.py`, RLS bypass) and is disabled when the key is unset.
+Auth: `POST /auth/register`, `POST /auth/login`, `POST /auth/logout`,
+`GET|PATCH /auth/me`, `GET /auth/me/classes`, `POST /auth/me/classes/join`,
+`POST /auth/complete-onboarding`, `GET /auth/me/navigator-defaults`.
 
-Memory linking (Stage 3a): a node's `connections uuid[]` is injected into chat
-context, LCA-trimmed (same session: shared ancestors excluded; other session:
-full chain), as a source-labelled reference block — see `services/memory.py`.
+Workspace: `/sessions` (CRUD, tree, `PUT /{id}/node-positions` bulk),
+`/nodes` (navigator cleanup, position, memory-link connections), `/tags`,
+`/files` (upload, list, tags, links, retry, chunk context),
+`/home/summary`, `/home/suggestions`*, `POST /chat/stream`* (SSE),
+`POST /overseer/stream`* (SSE). `*` = needs `X-Gemini-Key`.
 
-Embedding pipeline (Stage 3b-1): upload -> `embedding_split` (extract PDF/txt ->
-chunk -> file_chunks(pending) -> fan out `embedding_batch` jobs) -> parallel
-batches embed with gemini-embedding-001 (768-dim, L2-normalized) -> file status
-`indexed`/`partial`.
-
-Visual RAG + file tagging (Stage 3b-2, `services/rag.py`): a file linked to a
-node applies to that node's descendant branch. At chat time, files linked on the
-current head's ancestor chain are cosine-searched (RETRIEVAL_QUERY embedding ->
-`search_file_chunks` RPC, owner-scoped) and the top-K chunks are injected as a
-"[연결된 자료에서 참고]" block. On `indexed`, the worker extracts up to 50 concept
-tags and links them via `upsert_file_tags`. OCR, class-material cross-visibility,
-and the full no-link search-suggestion flow are Stage 3b-3.
-
-## AI layer (`app/ai/`)
-
-- `skills/` — one capability per file, auto-discovered into a `SKILLS` registry;
-  `catalog()` renders name+description for prompt injection. Skills receive a
-  `SkillContext` (ctx=) with the caller's RLS client + identity.
-  Read-skills: `read_my_spaces`, `read_recent_sessions`, `read_top_concepts`,
-  `find_sessions_by_topic`; plus `generate_navigator_questions`.
-- `react.py` — minimal budgeted ReAct runner with best-effort `ai_sessions` /
-  `ai_steps` tracing. The overseer (`services/overseer.py`) runs the read-skills
-  to build a workspace snapshot, then streams a navigational reply + action
-  buttons.
+Teacher (`role=teacher`): `/teacher/classes`, `/teacher/classes/overview`,
+students, a student's class sessions, materials. Admin (`role=admin`):
+`/admin/users`, role change, `/admin/settings`, `/admin/usage`,
+`/admin/logs` (poll with `after=`), `/admin/logs/{id}`, `/admin/traces`.
 
 ## Migrations
 
-SQL lives in `../supabase/migrations/`. Applied by the leader via Supabase MCP
-— do not apply manually here.
-- `0001_init.sql` — profiles, classes, class_members, sessions, nodes + RLS
-- `0002`..`0004` — class join RPC, RLS hardening, atomic chat-node append
-- `0005_tags.sql` — tags, node_tags + RLS + upsert_node_tags / tag_cooccurrence
-- `0006_ai_trace.sql` — ai_sessions, ai_steps (ReAct trace) + owner RLS
+`db/migrations/20260926000000_baseline.sql` is the squashed schema (tables,
+indexes, SQL functions). Add new changes as new dbmate files
+(`-- migrate:up` / `-- migrate:down`). SQL functions read the caller from
+`app.current_user_id()`, which the backend sets per transaction.
