@@ -1,0 +1,106 @@
+# nodi — local stack.  Quick start:
+#   cp .env.example .env
+#   docker compose up -d --build
+#
+# Every variable below has a default, so the stack also boots without a .env.
+# There is no server-side AI key: each user enters their own Gemini API key in
+# the web UI and it is sent per request (X-Gemini-Key).
+
+name: nodi
+
+services:
+  # --- PostgreSQL 16 + pgvector ---------------------------------------------
+  db:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-nodi}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nodi}
+      POSTGRES_DB: ${POSTGRES_DB:-nodi}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    # Uncomment to reach the database from the host (psql, GUI clients):
+    # ports:
+    #   - "127.0.0.1:5432:5432"
+
+  # --- Schema migrations + one-time demo seed (dbmate) -------------------------
+  # 1) db/migrations -> tracked in `schema_migrations`
+  # 2) db/seed       -> tracked in `seed_migrations` (runs once per database)
+  migrate:
+    image: amacneil/dbmate:2
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://nodi:nodi@db:5432/nodi?sslmode=disable}
+      DBMATE_NO_DUMP_SCHEMA: "true"
+    volumes:
+      - ./db:/db:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        dbmate --wait --migrations-dir /db/migrations up &&
+        dbmate --migrations-dir /db/seed --migrations-table seed_migrations up
+    restart: "no"
+
+  # --- FastAPI backend -----------------------------------------------------------
+  backend:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://nodi:nodi@db:5432/nodi?sslmode=disable}
+      JWT_SECRET: ${JWT_SECRET:-}
+      JWT_EXPIRE_DAYS: ${JWT_EXPIRE_DAYS:-7}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+      STORAGE_DIR: /data/uploads
+      SEED_UPLOADS_DIR: /app/seed_uploads
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+    volumes:
+      - uploads:/data/uploads
+      - ./db/seed/uploads:/app/seed_uploads:ro
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status == 200 else 1)"
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+      retries: 5
+
+  # --- Next.js frontend -------------------------------------------------------------
+  # The browser only talks to this service; /api/* is proxied to the backend
+  # (same origin, so the httpOnly session cookie is first-party).
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # Target of the /api/* rewrite (baked into the build output).
+        BACKEND_URL: http://backend:8000
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      BACKEND_URL: http://backend:8000
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+
+volumes:
+  db-data:
+  uploads:

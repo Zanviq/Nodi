@@ -18,3 +18,6 @@ __pycache__/
 # OS / 에디터
 Thumbs.db
 .DS_Store
+
+# Screenshot script deps
+scripts/capture-screenshots/node_modules/
