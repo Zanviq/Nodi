@@ -387,7 +387,7 @@ export default function SessionGraphCanvas(props: Props) {
         const p = filePosRef.current.get(f.id);
         const s2 = d3.select(this);
         if (p) s2.attr("transform", `translate(${p.x},${p.y})`);
-        const busy = f.status !== "indexed";
+        const busy = f.status !== "indexed" && f.status !== "needs_key";
         const fail = f.status === "failed" || f.status === "partial";
         const stroke = fail ? C.fileFail : busy ? C.fileBusy : C.file;
         s2.select("rect.fbox").attr("fill", C.fileFill).attr("stroke", stroke).attr("stroke-width", 1.5);
@@ -399,7 +399,7 @@ export default function SessionGraphCanvas(props: Props) {
         s2.select("text.fname").text(nm.length > 10 ? nm.slice(0, 10) + "…" : nm);
         const tg = fileTags[f.id];
         const tagLine = tg && tg.length > 0 ? `\n태그: ${tg.slice(0, 8).map((t) => "#" + t).join(" ")}` : "";
-        s2.select("title").text(`📎 ${nm}${busy ? " (임베딩 중)" : ""}${tagLine}`);
+        s2.select("title").text(`📎 ${nm}${busy ? " (임베딩 중)" : ""}${f.status === "needs_key" ? " (API 키 필요 — 자료 검색 대기)" : ""}${tagLine}`);
       });
       fm.call(fdrag);
       fm.on("contextmenu", function (event, f) {
@@ -1062,7 +1062,7 @@ export default function SessionGraphCanvas(props: Props) {
       const p = filePosRef.current.get(f.id);
       const s2 = d3.select(this);
       if (p) s2.attr("transform", `translate(${p.x},${p.y})`);
-      const busy = f.status !== "indexed";
+      const busy = f.status !== "indexed" && f.status !== "needs_key";
       const fail = f.status === "failed" || f.status === "partial";
       const stroke = fail ? C.fileFail : busy ? C.fileBusy : C.file;
       // 08 F: 낙관 배치(미확정)는 반투명 pending(서버 확정 시 1.0으로 실체화).
@@ -1078,7 +1078,7 @@ export default function SessionGraphCanvas(props: Props) {
       s2.select("text.fname").text(nm.length > 10 ? nm.slice(0, 10) + "…" : nm);
       const tg = fileTags[f.id];
       const tagLine = tg && tg.length > 0 ? `\n태그: ${tg.slice(0, 8).map((t) => "#" + t).join(" ")}` : "";
-      s2.select("title").text(`📎 ${nm}${busy ? " (임베딩 중)" : ""}${tagLine}`);
+      s2.select("title").text(`📎 ${nm}${busy ? " (임베딩 중)" : ""}${f.status === "needs_key" ? " (API 키 필요 — 자료 검색 대기)" : ""}${tagLine}`);
     });
     fmerged.call(fileDrag);
     fmerged.on("contextmenu", function (event, f) {

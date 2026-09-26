@@ -8,24 +8,25 @@ adding a capability is just dropping a new file in this package.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from ...services.supabase_client import UserClient
+    from ...db.client import UserClient
 
 
 @dataclass(frozen=True)
 class SkillContext:
     """Runtime context handed to a skill (not part of the traced input).
 
-    Carries the caller's RLS-scoped client and identity so read-skills can query
-    the caller's own data. Kept out of the ai_steps trace (no client/token in
-    the trace payload).
+    Carries the caller's access-checked client and identity so read-skills can
+    query the caller's own data, plus the caller's Gemini key for AI skills.
+    Kept out of the ai_steps trace (no client/key in the trace payload).
     """
 
     client: "UserClient"
     owner_id: str
+    api_key: str | None = field(default=None, repr=False)
 
 
 # A skill receives a SkillContext (ctx=) plus typed kwargs and returns a

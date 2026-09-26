@@ -1,11 +1,9 @@
 """Navigator node gate + INLINE generation (Stage 2 Part B).
 
 DESIGN NOTE — inline, not background:
-  architecture §7 envisions navigator creation as a background job (jobs queue +
-  apscheduler). That worker runs without a user JWT and therefore needs a
-  service_role key, which is currently empty. So Stage 2 generates navigator
-  nodes INLINE inside the user's chat request (gated), using the caller's JWT so
-  RLS still applies. The real background queue is deferred to Stage 3.
+  navigator nodes are generated INLINE inside the user's chat request (gated),
+  through the caller's access-checked client and with the caller's own Gemini
+  key (X-Gemini-Key), which only exists for the duration of that request.
 
 Gate (only fires when ALL hold):
   - the current branch (head's ancestor chain, real nodes only) has >= K nodes;
@@ -24,9 +22,10 @@ import logging
 from typing import Any
 
 from ..ai.react import Budget, ReActRunner
+from ..ai.skills.base import SkillContext
 from ..config import get_settings
+from ..db.client import UserClient
 from . import app_settings
-from .supabase_client import UserClient
 
 logger = logging.getLogger("nodi.navigator")
 settings = get_settings()
@@ -117,6 +116,8 @@ async def maybe_generate(
     head_id: str,
     nodes: list[dict[str, Any]],
     override: dict[str, Any] | None = None,
+    *,
+    api_key: str | None,
 ) -> list[dict[str, Any]]:
     """Evaluate the gate and, if it fires, create navigator nodes.
 
@@ -128,6 +129,8 @@ async def maybe_generate(
     this turn; ``count`` (1..5), ``gate_k`` (1..10), ``period`` (1..20).
     """
     override = override or {}
+    if not api_key:
+        return []
     # D47 enabled gate: an explicit user opt-out disables navigator this turn.
     if override.get("enabled") is False:
         return []
@@ -205,6 +208,8 @@ async def maybe_generate(
     obs = await runner.run_skill(
         "generate_navigator_questions",
         thought="Branch matured (>=K nodes, shared tags); suggest follow-ups.",
+        # The key travels in ctx, which is kept OUT of the ai_steps trace.
+        ctx=SkillContext(client=client, owner_id=owner_id, api_key=api_key),
         branch=branch_qa,
         tags=common_tags,
         count=count,

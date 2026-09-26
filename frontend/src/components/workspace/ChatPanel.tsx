@@ -20,6 +20,8 @@ import { useWorkspacePrefs } from "@/store/useWorkspacePrefs";
 import { getChunkContext, getSession } from "@/lib/api";
 import { ancestorChain, buildById, pathIdSet } from "@/lib/tree";
 import type { WorkspaceChat } from "@/lib/useWorkspaceChat";
+import { isGeminiKeyError, useHasGeminiKey } from "@/lib/geminiKey";
+import { GeminiKeyNotice } from "@/components/settings/GeminiKeyNotice";
 import type {
   ChunkContext,
   FileLink,
@@ -57,6 +59,7 @@ export function ChatPanel({
   const { data: detail, isLoading } = useSessionDetail(activeSessionId);
 
   const [input, setInput] = useState("");
+  const hasKey = useHasGeminiKey();
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -249,11 +252,19 @@ export function ChatPanel({
             </button>
           </div>
         )}
-        {chat.error && (
+        {!hasKey ? (
+          <GeminiKeyNotice compact className="mx-auto mb-2 max-w-2xl" />
+        ) : chat.error && isGeminiKeyError(chat.errorCode) ? (
+          <GeminiKeyNotice
+            compact
+            message={chat.error}
+            className="mx-auto mb-2 max-w-2xl"
+          />
+        ) : chat.error ? (
           <div className="mx-auto mb-2 max-w-2xl text-xs text-danger">
             {chat.error}
           </div>
-        )}
+        ) : null}
         <div className="mx-auto flex max-w-2xl items-end gap-2">
           <button
             type="button"
@@ -288,9 +299,13 @@ export function ChatPanel({
           <button
             type="button"
             onClick={handleSend}
-            disabled={chat.streaming || !input.trim()}
+            disabled={chat.streaming || !input.trim() || !hasKey}
             title={
-              chat.streaming ? "답변 생성 중에는 전송할 수 없어요" : undefined
+              !hasKey
+                ? "Gemini API 키를 입력하면 사용할 수 있어요"
+                : chat.streaming
+                  ? "답변 생성 중에는 전송할 수 없어요"
+                  : undefined
             }
             className="flex items-center gap-1 rounded-xl bg-accent-deep px-4 py-2 text-sm font-medium text-white transition-colors hover:brightness-95 disabled:opacity-60"
           >

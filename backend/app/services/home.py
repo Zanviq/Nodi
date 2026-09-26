@@ -1,14 +1,14 @@
 """Home dashboard + overseer data queries (Stage 4a).
 
-Plain, read-only, RLS-scoped queries reused by both the `/home/*` routers and
-the overseer read-skills. No LLM here.
+Plain, read-only, access-checked queries reused by both the `/home/*` routers
+and the overseer read-skills. No LLM here.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from .supabase_client import UserClient
+from ..db.client import UserClient
 
 
 async def get_my_spaces(
@@ -84,7 +84,7 @@ async def get_top_concepts(
 
 
 def _ilike(q: str) -> str:
-    # Escape PostgREST wildcards in the user query, then wrap for ILIKE.
+    # Strip ILIKE wildcards from the user query, then wrap for a contains-match.
     safe = q.replace("%", "").replace("*", "").replace(",", " ").strip()
     return f"ilike.*{safe}*"
 

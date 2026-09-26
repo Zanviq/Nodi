@@ -10,11 +10,17 @@ import {
   Plus,
   Trash2,
   RotateCcw,
+  KeyRound,
 } from "lucide-react";
 import { ApiError, deleteFile, retryFile, type SpaceTarget } from "@/lib/api";
 import { filesKey, useFileTags, useFiles } from "@/lib/queries";
 import { SkeletonList } from "@/components/ui/Skeleton";
 import type { FileLink, FileRow, FileStatus } from "@/lib/types";
+import {
+  isGeminiKeyError,
+  openGeminiKeyDialog,
+  useHasGeminiKey,
+} from "@/lib/geminiKey";
 
 /**
  * 워크스페이스 좌측 "자료" 패널.
@@ -49,6 +55,7 @@ const STATUS_META: Record<
   indexed: { label: "완료", cls: "bg-positive/20 text-positive", progress: false },
   partial: { label: "부분 실패", cls: "bg-warning/20 text-warning", progress: false },
   failed: { label: "실패", cls: "bg-danger/20 text-danger", progress: false },
+  needs_key: { label: "키 필요", cls: "bg-accent/40 text-accent-fg", progress: false },
 };
 
 export function FilesPanel({
@@ -94,8 +101,9 @@ export function FilesPanel({
   };
 
   const reportError = (e: unknown, what: string) => {
-    if (e instanceof ApiError && e.status === 503) {
-      setError("파일 임베딩이 아직 활성화되지 않았습니다(관리자 설정 필요).");
+    if (e instanceof ApiError && isGeminiKeyError(e.code)) {
+      setError(e.message);
+      openGeminiKeyDialog(e.message);
     } else {
       setError(`${what} 실패: ${(e as Error).message}`);
     }
@@ -193,11 +201,16 @@ function FileItem({
   onDelete: () => void;
   onRetry: () => void;
 }) {
-  const meta = STATUS_META[file.status];
+  const meta = STATUS_META[file.status] ?? STATUS_META.uploaded;
   const total = file.chunk_total ?? 0;
   const done = file.chunk_done ?? 0;
   const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
-  const canRetry = file.status === "failed" || file.status === "partial";
+  const hasKey = useHasGeminiKey();
+  const needsKey = file.status === "needs_key";
+  const canRetry =
+    file.status === "failed" ||
+    file.status === "partial" ||
+    (needsKey && hasKey);
 
   const { data: tags } = useFileTags(file.id, file.status === "indexed");
   const shownTags = (tags ?? []).slice(0, 4);
@@ -259,6 +272,26 @@ function FileItem({
 
       {(file.status === "failed" || file.status === "partial") && file.error && (
         <p className="mt-1 ml-6 text-[11px] text-danger">{file.error}</p>
+      )}
+
+      {needsKey && (
+        <p className="mt-1 ml-6 flex flex-wrap items-center gap-1 text-[11px] text-accent-fg">
+          <KeyRound size={11} className="shrink-0 text-accent-deep" />
+          {file.error === "gemini_key_invalid"
+            ? "API 키가 거부되어 자료 검색(RAG)을 준비하지 못했어요. 키를 확인한 뒤 재시도하세요."
+            : hasKey
+              ? "API 키가 설정됐어요. 재시도하면 자료 검색(RAG)을 쓸 수 있어요."
+              : "API 키를 설정하면 자료 검색(RAG)을 쓸 수 있어요."}
+          {!hasKey && (
+            <button
+              type="button"
+              onClick={() => openGeminiKeyDialog()}
+              className="font-medium text-accent-deep underline"
+            >
+              키 입력
+            </button>
+          )}
+        </p>
       )}
 
       {/* 태그 칩 */}

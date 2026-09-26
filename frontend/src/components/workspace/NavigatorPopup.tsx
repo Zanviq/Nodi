@@ -3,6 +3,8 @@
 import { useEffect } from "react";
 import { Compass, X, Send } from "lucide-react";
 import type { NodeRow } from "@/lib/types";
+import { useHasGeminiKey } from "@/lib/geminiKey";
+import { GeminiKeyNotice } from "@/components/settings/GeminiKeyNotice";
 
 /**
  * D40: 네비게이터 노드 클릭 시 뜨는 팝업.
@@ -28,6 +30,7 @@ export function NavigatorPopup({
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
+  const hasKey = useHasGeminiKey();
   const question = node.navigator_question ?? node.question ?? "";
   const rationale = node.navigator_meta?.rationale?.trim();
 
@@ -67,6 +70,8 @@ export function NavigatorPopup({
           </div>
         ) : null}
 
+        {!hasKey && <GeminiKeyNotice compact className="mt-3" />}
+
         <div className="mt-4 flex justify-end gap-2">
           <button
             type="button"
@@ -79,7 +84,7 @@ export function NavigatorPopup({
           <button
             type="button"
             onClick={onAsk}
-            disabled={busy}
+            disabled={busy || !hasKey}
             className="flex items-center gap-1 rounded-xl bg-accent-deep px-4 py-1.5 text-sm font-medium text-white transition-colors hover:brightness-95 disabled:opacity-60"
           >
             <Send size={14} />

@@ -10,6 +10,12 @@ import {
 } from "@/lib/api";
 import { sessionKey, sessionsKey } from "@/lib/queries";
 import { makeOptimisticId } from "@/lib/ids";
+import {
+  GEMINI_KEY_NOTICE,
+  isGeminiKeyError,
+  openGeminiKeyDialog,
+  readGeminiKey,
+} from "@/lib/geminiKey";
 import { useWorkspaceStore } from "@/store/useWorkspaceStore";
 import { useWorkspacePrefs } from "@/store/useWorkspacePrefs";
 import type { ChatNavigatorEvent, NodeRow, SessionDetail } from "@/lib/types";
@@ -36,6 +42,8 @@ export interface WorkspaceChat {
   draftQ: string;
   streamAnswer: string;
   error: string | null;
+  /** 오류 코드(gemini_key_required 등). 키 관련이면 UI가 [키 입력] 안내를 붙인다. */
+  errorCode: string | null;
   /** D36: 직전 provisional→real 교체 정보(캔버스 좌표 승계·전환 모션용). */
   lastReplace: ProvisionalReplace | null;
   send: (
@@ -75,6 +83,7 @@ export function useWorkspaceChat(target: SpaceTarget): WorkspaceChat {
   const [draftQ, setDraftQ] = useState("");
   const [streamAnswer, setStreamAnswer] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [errorCode, setErrorCode] = useState<string | null>(null);
   const [lastReplace, setLastReplace] = useState<ProvisionalReplace | null>(null);
   const replaceNonceRef = useRef(0);
 
@@ -127,7 +136,16 @@ export function useWorkspaceChat(target: SpaceTarget): WorkspaceChat {
       const q = question.trim();
       if (!q || !activeSessionId || streaming) return { ok: false };
 
+      // 키가 없으면 요청·낙관 노드 없이 안내만(서버도 거절하지만 왕복을 아낀다).
+      if (!readGeminiKey()) {
+        setError(GEMINI_KEY_NOTICE);
+        setErrorCode("gemini_key_required");
+        openGeminiKeyDialog(GEMINI_KEY_NOTICE);
+        return { ok: false };
+      }
+
       setError(null);
+      setErrorCode(null);
       setDraftQ(q);
       setStreamAnswer("");
       setStreaming(true);
@@ -138,6 +156,7 @@ export function useWorkspaceChat(target: SpaceTarget): WorkspaceChat {
       abortRef.current = controller;
       let acc = "";
       let okFlag = false;
+      let errFlag = false;
 
       const refIds = opts?.referenceNodeIds?.length
         ? opts.referenceNodeIds
@@ -238,8 +257,11 @@ export function useWorkspaceChat(target: SpaceTarget): WorkspaceChat {
               queryKey: sessionsKey(target),
             });
           },
-          onError: (detail) => {
+          onError: (detail, code) => {
+            errFlag = true;
             setError(detail);
+            setErrorCode(code);
+            if (isGeminiKeyError(code)) openGeminiKeyDialog(detail);
             setDraftQ("");
             setStreamAnswer("");
             setStreaming(false);
@@ -252,6 +274,14 @@ export function useWorkspaceChat(target: SpaceTarget): WorkspaceChat {
       // 빈 응답(done 없이 종료)도 롤백.
       if (!okFlag) {
         removeNode(sessionId, tempId);
+      }
+      // done·error 없이 스트림이 끝났으면(프록시 절단 등) 입력 잠금을 풀고 안내한다.
+      if (!okFlag && !errFlag && !controller.signal.aborted) {
+        setStreaming(false);
+        setDraftQ("");
+        setStreamAnswer("");
+        setError("응답이 중단됐어요. 다시 시도해 주세요.");
+        setErrorCode(null);
       }
 
       // 스트림 종료 후 1회 재동기화(rag_sources·reference_sources·네비게이터 영속 반영).
@@ -275,6 +305,13 @@ export function useWorkspaceChat(target: SpaceTarget): WorkspaceChat {
   const askNavigator = useCallback(
     async (node: NodeRow) => {
       if (streaming) return;
+      // 키가 없으면 네비게이터를 지우기 전에 멈춘다(삭제 후 전송 실패로 추천이 사라지지 않게).
+      if (!readGeminiKey()) {
+        setError(GEMINI_KEY_NOTICE);
+        setErrorCode("gemini_key_required");
+        openGeminiKeyDialog(GEMINI_KEY_NOTICE);
+        return;
+      }
       const parentId = node.parent_id;
       const question = node.navigator_question ?? node.question;
 
@@ -305,6 +342,7 @@ export function useWorkspaceChat(target: SpaceTarget): WorkspaceChat {
     draftQ,
     streamAnswer,
     error,
+    errorCode,
     lastReplace,
     send,
     askNavigator,

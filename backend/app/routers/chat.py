@@ -13,7 +13,12 @@ SSE event schema:
   event: done       data: {"node":{"id","parent_id","label","tags":[...]},
                            "current_head_id","root_node_id"}
   event: navigator  data: {"nodes":[{"id","parent_id","navigator_question"}]}
-  event: error      data: {"detail"}
+  event: error      data: {"detail", "code"?}
+
+Gemini key: the caller's own key comes in the `X-Gemini-Key` header. Without
+it the stream is a single `error` event with code "gemini_key_required" (no DB
+writes, no AI call). An invalid/over-quota key yields code
+"gemini_key_invalid" / "gemini_quota_exceeded".
 
 Tagging (Stage 2 Part A): after the node is persisted, concept tags are
 attached and returned INLINE in the `done` event (node.tags). Label and tag
@@ -22,8 +27,8 @@ extraction run concurrently to limit added latency; tagging is best-effort
 
 Navigator (Stage 2 Part B): after `done`, a gate may fire and create waiting
 is_navigator nodes; when it does, a separate `navigator` event carries them.
-Generated INLINE (not a background job) under the caller's JWT — see
-services/navigator.py for the rationale. Best-effort: never blocks the turn.
+Generated INLINE (not a background job) with the caller's identity and key —
+see services/navigator.py. Best-effort: never blocks the turn.
 """
 
 from __future__ import annotations
@@ -36,11 +41,12 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from ..ai_key import MESSAGES, classify_ai_error, gemini_key_status
 from ..auth.deps import CurrentUser, get_current_user
+from ..db.client import UserClient
 from ..services import gemini, memory, navigator, rag
 from ..services import sessions as svc
 from ..services import tagging
-from ..services.supabase_client import UserClient
 from ..services.turn_log import TurnLog
 
 logger = logging.getLogger("nodi.chat")
@@ -77,11 +83,41 @@ def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+_SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
+
+
+def sse_key_error(code: str) -> StreamingResponse:
+    """A one-event SSE stream reporting a missing/invalid Gemini key."""
+
+    async def one():
+        yield _sse("error", {"code": code, "detail": MESSAGES[code]})
+
+    return StreamingResponse(
+        one(), media_type="text/event-stream", headers=_SSE_HEADERS
+    )
+
+
+def _ai_error_payload(exc: BaseException, default_detail: str) -> dict:
+    code = classify_ai_error(exc)
+    if code:
+        return {"code": code, "detail": MESSAGES[code]}
+    return {"detail": default_detail}
+
+
 @router.post("/stream")
 async def chat_stream(
     body: ChatStreamBody,
     user: CurrentUser = Depends(get_current_user),
+    key_status: tuple[str | None, str | None] = Depends(gemini_key_status),
 ) -> StreamingResponse:
+    api_key, key_error = key_status
+    if key_error:
+        # AI endpoint without a usable key: report it in-stream, touch nothing.
+        return sse_key_error(key_error)
     client = UserClient.from_user(user)
 
     # Validate access + resolve context BEFORE streaming so auth/404 errors are
@@ -122,7 +158,7 @@ async def chat_stream(
         (comparison_context, comparison_node_ids, comparison_sources),
     ) = await asyncio.gather(
         memory.build_reference_context(client, body.session_id, chain, by_id),
-        rag.build_rag_context(client, chain, body.question),
+        rag.build_rag_context(client, chain, body.question, api_key),
         memory.build_comparison_context(
             client, body.reference_node_ids or [], chain, by_id
         ),
@@ -161,16 +197,19 @@ async def chat_stream(
                 async for delta in gemini.stream_answer(
                     history,
                     body.question,
+                    api_key=api_key,
                     reference_context=reference_context,
                     rag_context=rag_context,
                     comparison_context=comparison_context,
                 ):
                     answer_parts.append(delta)
                     yield _sse("token", {"delta": delta})
-            except Exception:  # noqa: BLE001 - details go to logs, not the client
+            except Exception as exc:  # noqa: BLE001 - details go to logs only
                 logger.exception("Gemini streaming failed")
                 tlog.add_error("ai_streaming_failed")
-                yield _sse("error", {"detail": "AI 응답 생성에 실패했습니다."})
+                yield _sse(
+                    "error", _ai_error_payload(exc, "AI 응답 생성에 실패했습니다.")
+                )
                 return
 
             answer = "".join(answer_parts).strip()
@@ -190,8 +229,8 @@ async def chat_stream(
                 # Label (best-effort) is needed for the atomic node insert; tag
                 # names are linked right after we have the node id.
                 label, tag_names = await asyncio.gather(
-                    gemini.generate_label(body.question, answer),
-                    tagging.extract_concepts(body.question, answer),
+                    gemini.generate_label(body.question, answer, api_key),
+                    tagging.extract_concepts(body.question, answer, api_key),
                 )
                 node = await svc.append_node(
                     client, body.session_id, parent_id, body.question, answer, label
@@ -270,6 +309,7 @@ async def chat_stream(
                             if body.navigator is not None
                             else None
                         ),
+                        api_key=api_key,
                     )
                     if nav_nodes:
                         tlog.add_skill("navigator", count=len(nav_nodes))
@@ -286,11 +326,5 @@ async def chat_stream(
             await tlog.save(client)
 
     return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+        event_stream(), media_type="text/event-stream", headers=_SSE_HEADERS
     )

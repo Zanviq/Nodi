@@ -6,7 +6,7 @@ shared with all class members). Teachers do not have a chat workspace — there 
 no teacher chat endpoint here.
 
 Auth: every endpoint requires app role 'teacher' (gate) AND per-class
-is_class_teacher (data scope, enforced in the RPCs / RLS).
+is_class_teacher (data scope, enforced in the RPCs / access layer).
 """
 
 from __future__ import annotations
@@ -18,12 +18,12 @@ from pydantic import BaseModel, Field
 
 from ..auth.deps import CurrentUser, Profile, get_current_user, require_role
 from ..services import files as files_svc
-from ..services.supabase_client import UserClient
+from ..db.client import UserClient
 
 router = APIRouter(prefix="/teacher", tags=["teacher"])
 
 # Gate: caller must be an app-role 'teacher'. Per-class authority is checked by
-# is_class_teacher() inside the RPCs / RLS.
+# is_class_teacher() inside the RPCs / access layer.
 require_teacher = require_role("teacher")
 
 SESSION_SELECT = (
@@ -60,7 +60,7 @@ async def list_class_overview(
     """Teacher console HOME data (D67): one row per class the caller teaches,
     each with student_count, material_count and last_activity_at.
 
-    Delegates to the teacher_class_overview() SECURITY DEFINER RPC (0023), which
+    Delegates to the teacher_class_overview() RPC, which
     self-guards via is_class_teacher(c.id) — so a teacher sees only their own
     classes. The legacy /classes (dropdown) endpoint is unchanged.
     """
@@ -81,7 +81,7 @@ async def create_class(
 ) -> dict[str, Any]:
     """Create a class owned by the calling teacher (D33).
 
-    Delegates to the `create_class` SECURITY DEFINER RPC: it re-checks the
+    Delegates to the `create_class` RPC: it re-checks the
     teacher app-role, inserts the class (teacher_id = caller, unique join_code),
     and enrolls the caller as a class teacher. Returns the new class row
     (id, name, join_code, teacher_id, created_at). Students join later with the
@@ -112,7 +112,7 @@ async def list_student_sessions(
     user: CurrentUser = Depends(get_current_user),
     _: Profile = Depends(require_teacher),
 ) -> list[dict[str, Any]]:
-    """A student's sessions in THIS class space (teacher reads via RLS R2).
+    """A student's sessions in THIS class space (teacher read rule R2).
 
     Open a session's nodes via GET /sessions/{id} (teacher access allowed).
     """

@@ -1,19 +1,17 @@
 [project]
 name = "nodi-backend"
-version = "0.1.0"
-description = "nodi backend — FastAPI + Supabase (Stage 0 foundation)"
+version = "0.2.0"
+description = "nodi backend — FastAPI + PostgreSQL (pgvector)"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
-    "python-jose[cryptography]>=3.3",
-    "httpx>=0.27",
-    "supabase>=2.6",
-    "google-genai>=0.3",
-    "apscheduler>=3.10",
-    "python-ulid>=2.2",
+    "python-jose[cryptography]>=3.4",
+    "asyncpg>=0.29",
+    "bcrypt>=4.1",
+    "google-genai>=1.0",
     "pypdf>=4.0",
     "python-multipart>=0.0.9",
 ]

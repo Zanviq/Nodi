@@ -11,20 +11,19 @@ import logging
 import math
 import re
 
-from google import genai
 from google.genai import types
 
 from ..config import get_settings
 from . import app_settings
-from .gemini import get_client
+from .gemini import ai_session
 
 logger = logging.getLogger("nodi.embedding")
 settings = get_settings()
 
-# The file_chunks.embedding column is a FIXED vector(768) (migration 0009). The
-# embedding worker guards against an admin setting embedding_dimension to any
+# The file_chunks.embedding column is a FIXED vector(768) (baseline schema). The
+# file pipeline guards against an admin setting embedding_dimension to any
 # other value (it would make insert/search fail or be meaningless) — see
-# embedding_worker. This constant is the contract that guard checks against.
+# file_pipeline. This constant is the contract that guard checks against.
 DB_VECTOR_DIM = 768
 
 
@@ -38,6 +37,7 @@ def _l2_normalize(vec: list[float]) -> list[float]:
 async def embed_texts(
     texts: list[str],
     *,
+    api_key: str | None,
     task_type: str = "RETRIEVAL_DOCUMENT",
     model: str | None = None,
     dimension: int | None = None,
@@ -48,9 +48,12 @@ async def embed_texts(
 
     D62: `model`/`dimension` default to the admin overlay (falling back to
     config) so model/dimension changes take effect. Callers that have already
-    resolved (and guarded) these values — the embedding worker — pass them
+    resolved (and guarded) these values — the file pipeline — pass them
     explicitly; the query path (rag.search) leaves them None to auto-resolve,
     keeping query and document embeddings in the SAME space.
+
+    `api_key` is the caller's own Gemini key (X-Gemini-Key); GeminiKeyError
+    when absent.
     """
     if not texts:
         return []
@@ -64,21 +67,21 @@ async def embed_texts(
             dimension = app_settings.as_int(
                 overlay, "embedding_dimension", settings.embedding_dimension, 1, 10000
             )
-    client: genai.Client = get_client()
     out: list[list[float]] = []
     step = max(1, settings.embedding_request_max_chunks)
-    for i in range(0, len(texts), step):
-        batch = texts[i : i + step]
-        resp = await client.aio.models.embed_content(
-            model=model,
-            contents=batch,
-            config=types.EmbedContentConfig(
-                output_dimensionality=dimension,
-                task_type=task_type,
-            ),
-        )
-        for emb in resp.embeddings:
-            out.append(_l2_normalize(list(emb.values)))
+    async with ai_session(api_key) as aio:
+        for i in range(0, len(texts), step):
+            batch = texts[i : i + step]
+            resp = await aio.models.embed_content(
+                model=model,
+                contents=batch,
+                config=types.EmbedContentConfig(
+                    output_dimensionality=dimension,
+                    task_type=task_type,
+                ),
+            )
+            for emb in resp.embeddings:
+                out.append(_l2_normalize(list(emb.values)))
     return out
 
 

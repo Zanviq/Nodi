@@ -3,25 +3,34 @@
 from __future__ import annotations
 
 from fastapi import APIRouter
+from fastapi.responses import JSONResponse
 
 from ..config import get_settings
+from ..db.pool import get_pool
 
 router = APIRouter(tags=["health"])
 settings = get_settings()
 
 
 @router.get("/health")
-async def health() -> dict:
-    """Liveness probe + a glimpse of which integrations are configured.
+async def health():
+    """Liveness + database readiness. 503 while the database is unreachable.
 
-    Does not expose secret values — only whether they are present.
+    Exposes no secrets. AI is always per-request (X-Gemini-Key), so there is no
+    server-side AI configuration to report.
     """
-    return {
-        "status": "ok",
+    db_ok = False
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            db_ok = (await conn.fetchval("select 1")) == 1
+    except Exception:  # noqa: BLE001 - reported as not ready
+        db_ok = False
+    body = {
+        "status": "ok" if db_ok else "degraded",
         "service": "nodi-backend",
         "environment": settings.environment,
-        "supabase_configured": bool(settings.supabase_url),
-        "jwks_configured": bool(settings.jwks_url),
-        "service_role_present": bool(settings.supabase_service_role_key),
-        "gemini_configured": bool(settings.google_gemini_api_key),
+        "database": db_ok,
+        "ai_key_mode": "per-request",
     }
+    return JSONResponse(body, status_code=200 if db_ok else 503)

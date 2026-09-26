@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from .supabase_client import UserClient
+from ..db.client import UserClient
 
 logger = logging.getLogger("nodi.turn_log")
 

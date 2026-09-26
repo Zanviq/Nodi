@@ -5,20 +5,22 @@ import { usePathname } from "next/navigation";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   Home,
+  KeyRound,
   Settings,
   Shield,
   School,
   TreeDeciduous,
   type LucideIcon,
 } from "lucide-react";
-import { useMyClasses, useProfile } from "@/lib/hooks";
+import { profileName, useMyClasses, useProfile } from "@/lib/hooks";
+import { openGeminiKeyDialog, useHasGeminiKey } from "@/lib/geminiKey";
 import { listSessions, spaceTargetFromId } from "@/lib/api";
 import { sessionsKey, STALE } from "@/lib/queries";
 import { roleHome } from "@/lib/roleHome";
 
 /**
  * 좌측 64px 아이콘 사이드바 (dark brown).
- * 항목: [홈 진입] · [공간 전환: 개인 + 가입 학급] · [프로필·설정]
+ * 항목: [홈 진입] · [공간 전환: 개인 + 가입 학급] · [Gemini API 키] · [프로필·설정]
  * 공간은 실제 데이터(개인 + class_members→classes). 미로그인/로딩 시에도 셸이 깨지지 않음.
  */
 
@@ -95,6 +97,8 @@ export function IconSidebar() {
   const { data: profile } = useProfile();
   const { data: myClasses = [] } = useMyClasses();
   const queryClient = useQueryClient();
+  const hasKey = useHasGeminiKey();
+  const name = profileName(profile);
 
   const role = profile?.role ?? null;
   const isStudent = !role || role === "student";
@@ -191,22 +195,32 @@ export function IconSidebar() {
 
       {/* 프로필·설정 (하단 고정) */}
       <div className="mt-auto flex flex-col items-center gap-1">
+        <button
+          type="button"
+          onClick={() => openGeminiKeyDialog()}
+          title={hasKey ? "Gemini API 키 (설정됨)" : "Gemini API 키 (미설정)"}
+          aria-label="Gemini API 키"
+          className="relative flex h-11 w-11 items-center justify-center rounded-xl text-sidebar-fg transition-colors hover:bg-white/5 hover:text-sidebar-fg-active"
+        >
+          <KeyRound size={20} strokeWidth={2} />
+          <span
+            className={`absolute right-2 top-2 h-2 w-2 rounded-full ${
+              hasKey ? "bg-positive" : "bg-accent-deep"
+            }`}
+          />
+        </button>
         <NavIcon
           href="/profile"
-          label={
-            profile?.display_name
-              ? `프로필·설정 (${profile.display_name})`
-              : "프로필·설정"
-          }
+          label={name ? `프로필·설정 (${name})` : "프로필·설정"}
           icon={Settings}
           active={isActive("/profile")}
         />
-        {profile?.display_name ? (
+        {name ? (
           <span
-            title={profile.display_name}
+            title={name}
             className="flex h-7 w-7 items-center justify-center rounded-full bg-white/10 text-[11px] font-semibold text-sidebar-fg-active"
           >
-            {initials(profile.display_name, "나")}
+            {initials(name, "나")}
           </span>
         ) : null}
       </div>

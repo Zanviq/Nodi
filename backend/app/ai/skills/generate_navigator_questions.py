@@ -17,8 +17,8 @@ import logging
 from google.genai import types
 
 from ...config import get_settings
-from ...services.gemini import get_client
-from .base import Skill
+from ...services.gemini import ai_session
+from .base import Skill, SkillContext
 
 logger = logging.getLogger("nodi.ai.navigator_skill")
 settings = get_settings()
@@ -87,6 +87,7 @@ async def run(
     tags: list[str],
     count: int | None = None,
     model: str | None = None,
+    ctx: SkillContext | None = None,
     **_: object,
 ) -> dict:
     n = count or settings.navigator_question_count
@@ -98,19 +99,19 @@ async def run(
         tags=", ".join(tags) if tags else "(none)",
         branch=_format_branch(branch),
     )
-    client = get_client()
-    resp = await client.aio.models.generate_content(
-        model=model,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            # Disable "thinking" (on by default for 2.5-flash) so the token
-            # budget produces the answer, not internal reasoning.
-            thinking_config=types.ThinkingConfig(thinking_budget=0),
-            max_output_tokens=1000,
-            temperature=0.7,
-        ),
-    )
+    async with ai_session(ctx.api_key if ctx else None) as aio:
+        resp = await aio.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                # Disable "thinking" (on by default for 2.5-flash) so the token
+                # budget produces the answer, not internal reasoning.
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+                max_output_tokens=1000,
+                temperature=0.7,
+            ),
+        )
     tokens = None
     usage = getattr(resp, "usage_metadata", None)
     if usage is not None:

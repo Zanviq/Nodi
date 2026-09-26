@@ -10,11 +10,12 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
-from fastapi import HTTPException, status
 from google import genai
 from google.genai import types
 
+from ..ai_key import GeminiKeyError, classify_ai_error
 from ..config import get_settings
 from . import app_settings
 
@@ -29,19 +30,27 @@ _SYSTEM_INSTRUCTION = (
     "Respond in the user's language."
 )
 
-_client: genai.Client | None = None
+@asynccontextmanager
+async def ai_session(api_key: str | None):
+    """Per-call async Gemini client built from the CALLER'S key.
 
-
-def get_client() -> genai.Client:
-    global _client
-    if _client is None:
-        if not settings.google_gemini_api_key:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="GOOGLE_GEMINI_API_KEY is not configured.",
-            )
-        _client = genai.Client(api_key=settings.google_gemini_api_key)
-    return _client
+    No module-level client: the key is user-supplied per request (X-Gemini-Key)
+    and must never outlive the request. Raises GeminiKeyError when absent.
+    """
+    if not api_key:
+        raise GeminiKeyError()
+    client = genai.Client(api_key=api_key)
+    try:
+        yield client.aio
+    finally:
+        try:
+            await client.aio.aclose()
+        except Exception:  # noqa: BLE001 - closing is best-effort
+            pass
+        try:
+            client.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _build_contents(
@@ -178,6 +187,8 @@ def compose_system_instruction(
 async def stream_answer(
     history: list[tuple[str, str]],
     question: str,
+    *,
+    api_key: str,
     reference_context: str | None = None,
     rag_context: str | None = None,
     comparison_context: str | None = None,
@@ -189,7 +200,6 @@ async def stream_answer(
     `comparison_context` = one-time referenced branches for comparison (D15).
     All are injected separately from the live ancestor chain.
     """
-    client = get_client()
     contents = _build_contents(history, question)
     config = types.GenerateContentConfig(
         system_instruction=compose_system_instruction(
@@ -197,14 +207,17 @@ async def stream_answer(
         )
     )
     overlay = await app_settings.get_overlay()
-    stream = await client.aio.models.generate_content_stream(
-        model=app_settings.as_str(overlay, "chat_model", settings.gemini_chat_model),
-        contents=contents,
-        config=config,
-    )
-    async for chunk in stream:
-        if chunk.text:
-            yield chunk.text
+    async with ai_session(api_key) as aio:
+        stream = await aio.models.generate_content_stream(
+            model=app_settings.as_str(
+                overlay, "chat_model", settings.gemini_chat_model
+            ),
+            contents=contents,
+            config=config,
+        )
+        async for chunk in stream:
+            if chunk.text:
+                yield chunk.text
 
 
 _OCR_PROMPT = (
@@ -214,30 +227,31 @@ _OCR_PROMPT = (
 )
 
 
-async def ocr_image_bytes(data: bytes, mime: str) -> str:
+async def ocr_image_bytes(data: bytes, mime: str, api_key: str | None) -> str:
     """OCR an image with the multimodal model. Returns '' on failure/empty."""
     try:
-        client = get_client()
         overlay = await app_settings.get_overlay()
-        resp = await client.aio.models.generate_content(
-            model=app_settings.as_str(overlay, "ocr_model", settings.ocr_model),
-            contents=[
-                types.Part.from_bytes(data=data, mime_type=mime),
-                types.Part.from_text(text=_OCR_PROMPT),
-            ],
-            config=types.GenerateContentConfig(
-                thinking_config=types.ThinkingConfig(thinking_budget=0),
-            ),
-        )
+        async with ai_session(api_key) as aio:
+            resp = await aio.models.generate_content(
+                model=app_settings.as_str(overlay, "ocr_model", settings.ocr_model),
+                contents=[
+                    types.Part.from_bytes(data=data, mime_type=mime),
+                    types.Part.from_text(text=_OCR_PROMPT),
+                ],
+                config=types.GenerateContentConfig(
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                ),
+            )
         return (resp.text or "").strip()
     except Exception as exc:  # noqa: BLE001 - OCR failure surfaces as empty text
         logger.warning("Image OCR failed: %s", exc)
         return ""
 
 
-async def generate_label(question: str, answer: str) -> str | None:
+async def generate_label(
+    question: str, answer: str, api_key: str | None
+) -> str | None:
     """Short topic label for a node. Best-effort: returns None on failure."""
-    client = get_client()
     overlay = await app_settings.get_overlay()
     max_chars = app_settings.as_int(
         overlay, "node_label_max_chars", settings.node_label_max_chars, 4, 16
@@ -251,15 +265,16 @@ async def generate_label(question: str, answer: str) -> str | None:
         f"Q: {question}\nA: {answer}"
     )
     try:
-        resp = await client.aio.models.generate_content(
-            model=app_settings.as_str(
-                overlay, "label_model", settings.gemini_label_model
-            ),
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                max_output_tokens=20, temperature=0.0
-            ),
-        )
+        async with ai_session(api_key) as aio:
+            resp = await aio.models.generate_content(
+                model=app_settings.as_str(
+                    overlay, "label_model", settings.gemini_label_model
+                ),
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    max_output_tokens=20, temperature=0.0
+                ),
+            )
         text = (resp.text or "").strip().strip('"').strip()
         if not text:
             return None
@@ -285,26 +300,30 @@ _OVERSEER_INSTRUCTION = (
 )
 
 
-async def stream_overseer(snapshot: str, message: str) -> AsyncIterator[str]:
+async def stream_overseer(
+    snapshot: str, message: str, api_key: str
+) -> AsyncIterator[str]:
     """Stream the overseer's short navigational reply (token events)."""
-    client = get_client()
     system = _OVERSEER_INSTRUCTION + "\n\n[워크스페이스 스냅샷]\n" + snapshot
     contents = [
         types.Content(role="user", parts=[types.Part.from_text(text=message)])
     ]
     overlay = await app_settings.get_overlay()
-    stream = await client.aio.models.generate_content_stream(
-        model=app_settings.as_str(overlay, "chat_model", settings.gemini_chat_model),
-        contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=system,
-            thinking_config=types.ThinkingConfig(thinking_budget=0),
-            max_output_tokens=600,
-        ),
-    )
-    async for chunk in stream:
-        if chunk.text:
-            yield chunk.text
+    async with ai_session(api_key) as aio:
+        stream = await aio.models.generate_content_stream(
+            model=app_settings.as_str(
+                overlay, "chat_model", settings.gemini_chat_model
+            ),
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=system,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+                max_output_tokens=600,
+            ),
+        )
+        async for chunk in stream:
+            if chunk.text:
+                yield chunk.text
 
 
 def _parse_json_array(raw: str, n: int) -> list[str]:
@@ -328,7 +347,7 @@ def _parse_json_array(raw: str, n: int) -> list[str]:
 
 
 async def generate_home_suggestions(
-    concepts: list[str], recent_titles: list[str], count: int
+    concepts: list[str], recent_titles: list[str], count: int, api_key: str
 ) -> list[str]:
     """Propose `count` starter questions from the user's concepts/activity.
 
@@ -343,21 +362,26 @@ async def generate_home_suggestions(
         f"Recent sessions: {', '.join(recent_titles) if recent_titles else '(none)'}"
     )
     try:
-        client = get_client()
         overlay = await app_settings.get_overlay()
-        resp = await client.aio.models.generate_content(
-            model=app_settings.as_str(
-                overlay, "navigator_model", settings.gemini_navigator_model
-            ),
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                thinking_config=types.ThinkingConfig(thinking_budget=0),
-                max_output_tokens=400,
-                temperature=0.8,
-            ),
-        )
+        async with ai_session(api_key) as aio:
+            resp = await aio.models.generate_content(
+                model=app_settings.as_str(
+                    overlay, "navigator_model", settings.gemini_navigator_model
+                ),
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                    max_output_tokens=400,
+                    temperature=0.8,
+                ),
+            )
         return _parse_json_array(resp.text or "", count)
     except Exception as exc:  # noqa: BLE001 - suggestions are optional
+        # A bad key / exhausted quota is surfaced so the UI can say so; any
+        # other failure just means "no suggestions this time".
+        code = classify_ai_error(exc)
+        if code:
+            raise GeminiKeyError(code) from None
         logger.warning("Home suggestion generation failed: %s", exc)
         return []

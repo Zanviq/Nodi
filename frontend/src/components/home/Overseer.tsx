@@ -4,6 +4,12 @@ import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import { Send, Sparkles, Plus, ArrowRight } from "lucide-react";
 import { streamOverseer } from "@/lib/api";
+import {
+  isGeminiKeyError,
+  openGeminiKeyDialog,
+  useHasGeminiKey,
+} from "@/lib/geminiKey";
+import { GeminiKeyNotice } from "@/components/settings/GeminiKeyNotice";
 import type { OverseerAction } from "@/lib/types";
 
 /**
@@ -29,7 +35,10 @@ export function Overseer({
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [streamText, setStreamText] = useState("");
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<{ text: string; code: string | null } | null>(
+    null,
+  );
+  const hasKey = useHasGeminiKey();
 
   const abortRef = useRef<AbortController | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -41,7 +50,7 @@ export function Overseer({
 
   const handleSend = async () => {
     const q = input.trim();
-    if (!q || streaming) return;
+    if (!q || streaming || !hasKey) return;
     setError(null);
     setInput("");
     setMessages((m) => [...m, { role: "user", text: q }]);
@@ -51,6 +60,7 @@ export function Overseer({
     const controller = new AbortController();
     abortRef.current = controller;
     let acc = "";
+    let finished = false;
 
     await streamOverseer(
       q,
@@ -64,17 +74,30 @@ export function Overseer({
             ...m,
             { role: "assistant", text: acc, actions: data.actions },
           ]);
+          finished = true;
           setStreaming(false);
           setStreamText("");
         },
-        onError: (detail) => {
-          setError(detail);
+        onError: (detail, code) => {
+          finished = true;
+          setError({ text: detail, code });
+          if (isGeminiKeyError(code)) openGeminiKeyDialog(detail);
           setStreaming(false);
           setStreamText("");
         },
       },
       controller.signal,
     );
+
+    // done·error 없이 스트림이 끝났으면(프록시 절단 등) 입력 잠금을 풀고 안내한다.
+    if (!finished && !controller.signal.aborted) {
+      if (acc) {
+        setMessages((m) => [...m, { role: "assistant", text: acc }]);
+      }
+      setError({ text: "응답이 중단됐어요. 다시 시도해 주세요.", code: null });
+      setStreaming(false);
+      setStreamText("");
+    }
   };
 
   return (
@@ -150,7 +173,13 @@ export function Overseer({
       </div>
 
       <div className="border-t border-accent-border/30 p-3">
-        {error && <p className="mb-2 text-xs text-danger">{error}</p>}
+        {!hasKey ? (
+          <GeminiKeyNotice compact className="mb-2" />
+        ) : error && isGeminiKeyError(error.code) ? (
+          <GeminiKeyNotice compact message={error.text} className="mb-2" />
+        ) : error ? (
+          <p className="mb-2 text-xs text-danger">{error.text}</p>
+        ) : null}
         <div className="flex items-end gap-2">
           <textarea
             value={input}
@@ -169,7 +198,7 @@ export function Overseer({
           <button
             type="button"
             onClick={handleSend}
-            disabled={streaming || !input.trim()}
+            disabled={streaming || !input.trim() || !hasKey}
             className="flex items-center gap-1 rounded-xl bg-accent-deep px-3 py-2 text-sm font-medium text-white transition-colors hover:brightness-95 disabled:opacity-60"
           >
             <Send size={14} />

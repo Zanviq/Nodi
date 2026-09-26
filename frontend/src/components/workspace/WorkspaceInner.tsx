@@ -32,6 +32,7 @@ import { useWorkspaceChat } from "@/lib/useWorkspaceChat";
 import { useOptimisticList } from "@/lib/useOptimisticList";
 import { isRealId } from "@/lib/ids";
 import { useResizablePanels } from "@/lib/useResizablePanels";
+import { useGeminiKeyFirstPrompt } from "@/lib/geminiKey";
 import { useWorkspaceStore } from "@/store/useWorkspaceStore";
 import type {
   FileGraphNode,
@@ -73,6 +74,9 @@ export function WorkspaceInner({ spaceId }: { spaceId: string }) {
   }, [reset, setActiveSpace, spaceId]);
 
   const chat = useWorkspaceChat(target);
+
+  // AI 기능 첫 진입: 키가 없으면 설정 안내를 한 번 띄운다(닫을 수 있음, 열람은 계속 가능).
+  useGeminiKeyFirstPrompt();
 
   // 홈에서 넘긴 보류 작업 소비: 세션 선택(+ 시드 질문 전송)
   useEffect(() => {
@@ -478,7 +482,7 @@ export function WorkspaceInner({ spaceId }: { spaceId: string }) {
           const f = await uploadFile(target, file, { sessionId: sid });
           await addFileGraphNode(sid, f.id, x, y).catch(() => {});
         } catch {
-          /* 503 등은 자료 패널 업로드에서 안내 */
+          /* 오류 안내는 자료 패널 업로드에서 */
         }
       }
       refreshFiles();

@@ -47,11 +47,11 @@ export function StudentsTab({ classId }: { classId: string }) {
                     <User size={14} className="shrink-0 opacity-70" />
                     <span className="min-w-0 flex-1 truncate">
                       <span className="block truncate">
-                        {s.display_name || s.email || s.user_id.slice(0, 8)}
+                        {s.display_name || s.username || s.user_id.slice(0, 8)}
                       </span>
-                      {s.display_name && s.email ? (
+                      {s.display_name && s.username ? (
                         <span className="block truncate text-[11px] text-fg-muted">
-                          {s.email}
+                          @{s.username}
                         </span>
                       ) : null}
                     </span>

@@ -1,22 +1,25 @@
 """File upload + registration (Stage 3b-1).
 
-Upload writes to Storage and inserts the `files` row + an `embedding_split` job
-via the service-role client (the worker pipeline needs service_role anyway).
-owner_id is set explicitly to the caller, preserving isolation. List/get are
-request-time reads and use the caller's RLS-scoped UserClient.
+Upload writes the bytes to local storage (STORAGE_DIR), inserts the `files`
+row with the trusted ServiceClient (owner_id set explicitly to the caller after
+the class membership / teacher checks below), then runs the RAG pipeline inline
+(services/file_pipeline.py) with the caller's own Gemini key, if any. List/get
+are request-time reads through the caller's access-checked UserClient.
 """
 
 from __future__ import annotations
 
+import logging
 import uuid
 from typing import Any
 
 from fastapi import HTTPException, status
 
 from ..config import get_settings
-from . import app_settings
-from .service_client import ServiceClient
-from .supabase_client import UserClient
+from ..db.client import ServiceClient, UserClient
+from . import app_settings, file_pipeline, storage
+
+logger = logging.getLogger("nodi.files")
 
 settings = get_settings()
 
@@ -30,7 +33,7 @@ FILE_SELECT = (
 async def _assert_class_member(
     user_client: UserClient, owner_id: str, class_id: str
 ) -> None:
-    """Verify the caller belongs to the class (RLS lets them read own row)."""
+    """Verify the caller belongs to the class (own membership row is readable)."""
     rows = await user_client.select(
         "class_members",
         {
@@ -70,6 +73,7 @@ async def upload_file(
     position_x: float | None = None,
     position_y: float | None = None,
     kind: str = "user_upload",
+    api_key: str | None = None,
 ) -> dict[str, Any]:
     if space_kind not in ("personal", "class"):
         raise HTTPException(
@@ -115,14 +119,22 @@ async def upload_file(
         )
 
     file_id = str(uuid.uuid4())
-    safe_name = (filename or "upload").replace("/", "_").replace("\\", "_")
+    safe_name = storage.safe_filename(filename)
     storage_path = f"{owner_id}/{file_id}/{safe_name}"
 
-    await service.storage_upload(
-        settings.storage_bucket, storage_path, data, mime or "application/octet-stream"
-    )
+    try:
+        await storage.save(storage_path, data)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Storing upload failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not store the file.",
+        ) from exc
 
-    rows = await service.insert(
+    try:
+        rows = await service.insert(
         "files",
         {
             "id": file_id,
@@ -139,22 +151,19 @@ async def upload_file(
             "position_x": position_x,
             "position_y": position_y,
         },
-    )
+        )
+    except Exception:
+        await storage.delete(storage_path)
+        raise
     file_row = rows[0]
 
-    # Enqueue the split job (worker picks it up).
-    await service.insert(
-        "jobs",
-        {
-            "owner_id": owner_id,
-            "kind": "embedding_split",
-            "target_id": file_id,
-            "status": "queued",
-            "space_ref": ref,
-        },
-        returning=False,
+    # Extract + chunk (+ embed and tag when the caller supplied a Gemini key)
+    # inside this request; the key never leaves it. Never raises.
+    await file_pipeline.process(service, file_row, data, api_key)
+    refreshed = await service.select(
+        "files", {"id": f"eq.{file_id}", "select": FILE_SELECT, "limit": "1"}
     )
-    return file_row
+    return refreshed[0] if refreshed else file_row
 
 
 async def get_file_tags(client: UserClient, file_id: str) -> list[str]:
@@ -170,7 +179,7 @@ async def _assert_file_owner(
 ) -> dict[str, Any]:
     """Return the file row, requiring the caller to be its OWNER (not just a
     class member who can read class_material)."""
-    file_row = await get_file(client, file_id)  # 404 unless accessible (RLS)
+    file_row = await get_file(client, file_id)  # 404 unless accessible
     if file_row.get("owner_id") != owner_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -179,33 +188,36 @@ async def _assert_file_owner(
     return file_row
 
 
-async def delete_file(
-    service: ServiceClient, client: UserClient, owner_id: str, file_id: str
-) -> None:
-    """Delete a file (owner only): Storage object + files row (cascades chunks/
-    links/file_tags), then prune any concept tags that became ORPHANS (D29).
+async def delete_file(client: UserClient, owner_id: str, file_id: str) -> None:
+    """Delete a file (owner only): files row (cascades chunks/links/file_tags)
+    + orphan concept tags (D29), then the stored bytes.
 
     The row delete + orphan-tag cleanup run atomically inside the
-    `delete_file_cascade` RPC (SECURITY DEFINER, owner-checked) under the
-    caller's JWT; shared tags (still used elsewhere) are preserved. Storage
-    object removal stays here on the service client.
+    `delete_file_cascade` RPC (owner-checked); shared tags (still used
+    elsewhere) are preserved. The object is removed after the row, so a failed
+    DB delete never leaves a row pointing at missing bytes.
     """
     file_row = await _assert_file_owner(client, owner_id, file_id)
+    await client.rpc("delete_file_cascade", {"p_file_id": file_id})
     storage_path = file_row.get("storage_path")
     if storage_path:
-        await service.storage_delete(settings.storage_bucket, storage_path)
-    await client.rpc("delete_file_cascade", {"p_file_id": file_id})
+        try:
+            await storage.delete(storage_path)
+        except Exception:  # noqa: BLE001 - an orphan object is harmless
+            logger.warning("Stored object removal failed for file=%s", file_id)
 
 
 async def retry_file(
-    service: ServiceClient, client: UserClient, owner_id: str, file_id: str
+    service: ServiceClient,
+    client: UserClient,
+    owner_id: str,
+    file_id: str,
+    api_key: str,
 ) -> str:
-    """Re-process a file (owner only). Delegates to the worker's idempotent
-    requeue. Returns the action taken."""
-    from . import embedding_worker  # local import avoids a worker import cycle
-
-    await _assert_file_owner(client, owner_id, file_id)
-    return await embedding_worker.requeue_file(service, file_id)
+    """Re-process a file (owner only) inline with the caller's Gemini key.
+    Returns the action taken ("reprocessed:<status>" / "reembedded:<status>")."""
+    file_row = await _assert_file_owner(client, owner_id, file_id)
+    return await file_pipeline.retry(service, file_row, api_key)
 
 
 async def list_files(
@@ -274,7 +286,7 @@ async def add_link(
     client: UserClient, owner_id: str, file_id: str, target_node_id: str
 ) -> dict[str, Any]:
     # Both the file and the node's session must be the caller's.
-    file_row = await get_file(client, file_id)  # 404 unless owner (RLS)
+    file_row = await get_file(client, file_id)  # 404 unless accessible
     session = await _owned_node_session(client, owner_id, target_node_id)
     # Space isolation: a file may only be linked within its own space.
     if (file_row.get("space_kind") != session.get("space_kind")) or (
@@ -345,7 +357,7 @@ async def list_session_file_links(
 async def set_file_position(
     client: UserClient, file_id: str, position_x: float | None, position_y: float | None
 ) -> dict[str, Any]:
-    """Persist a file-node's coordinates (D13). Owner only (RLS files_update_own)."""
+    """Persist a file-node's coordinates (D13). Owner only (files update rule)."""
     rows = await client.update(
         "files",
         {"id": f"eq.{file_id}"},
@@ -367,7 +379,7 @@ async def set_file_position(
 # (RAG): placing a file does NOT make it a RAG source, and RAG retrieval still
 # reads file_node_links ONLY (rag.linked_file_ids — unchanged). One file can be
 # placed on many session graphs. All reads/writes go through the caller's
-# RLS-scoped client (owner-only, fgn_* policies).
+# access-checked client (owner-only file_graph_nodes rules).
 # ---------------------------------------------------------------------------
 PLACEMENT_SELECT = (
     "id,file_id,session_id,position_x,position_y,created_at,"
@@ -411,7 +423,7 @@ async def add_placement(
     """Place a file as a node on a session graph (idempotent upsert on
     file_id+session_id). Caller must own both the file and the session, and they
     must share the same space (mirrors add_link isolation)."""
-    file_row = await get_file(client, file_id)  # 404 unless accessible (RLS)
+    file_row = await get_file(client, file_id)  # 404 unless accessible
     if file_row.get("owner_id") != owner_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -460,7 +472,7 @@ async def move_placement(
     position_x: float | None,
     position_y: float | None,
 ) -> dict[str, Any]:
-    """Update a placement's coordinates after drag (owner only via RLS)."""
+    """Update a placement's coordinates after drag (owner only, access layer)."""
     rows = await client.update(
         "file_graph_nodes",
         {"file_id": f"eq.{file_id}", "session_id": f"eq.{session_id}"},

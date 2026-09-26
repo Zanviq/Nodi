@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   ChevronRight,
@@ -14,7 +14,6 @@ import {
   GitBranch,
 } from "lucide-react";
 import { getAdminLogDetail, getAdminLogs, listAdminUsers } from "@/lib/api";
-import { createClient } from "@/lib/supabase/client";
 import type {
   AdminLog,
   AdminLogDetail,
@@ -27,10 +26,17 @@ import type {
 } from "@/lib/types";
 
 const LIMIT = 20;
+/** 신규 턴 폴링 주기(탭이 보일 때만). */
+const POLL_MS = 5000;
+
+/** 사용자 표시: 이름 → 아이디 → id. */
+function userLabel(u: AdminUser | undefined, fallback: string): string {
+  return u?.display_name?.trim() || u?.username || u?.email || fallback;
+}
 
 /**
  * 로그 탭(D25→D34): 채팅 턴 단위 ai_logs 실시간 모니터 + 턴 상세 슬라이드오버.
- * 과거 조회(사용자/날짜 필터·페이지네이션) + Supabase Realtime로 신규 턴 라이브 추가.
+ * 과거 조회(사용자/날짜 필터·페이지네이션) + 5초 폴링(after=최신 created_at)으로 신규 턴 추가.
  * 행 클릭 → 우측 상세 드로어(시스템 프롬프트 하이라이트·컨텍스트 블록·트레이스).
  */
 export function LogsTab() {
@@ -40,7 +46,7 @@ export function LogsTab() {
   const [offset, setOffset] = useState(0);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [liveLogs, setLiveLogs] = useState<AdminLog[]>([]);
-  const [live, setLive] = useState(false);
+  const [visible, setVisible] = useState(true);
 
   const { data: users } = useQuery<AdminUser[]>({
     queryKey: ["admin", "users"],
@@ -59,22 +65,12 @@ export function LogsTab() {
       }),
   });
 
-  // ── Realtime 구독: ai_logs INSERT → 목록 맨 위에 라이브 추가 ──
+  // 탭 가시성: 숨겨져 있으면 폴링을 멈춘다.
   useEffect(() => {
-    const supabase = createClient();
-    const channel = supabase
-      .channel("admin-ai_logs")
-      .on(
-        "postgres_changes",
-        { event: "INSERT", schema: "public", table: "ai_logs" },
-        (payload) => {
-          setLiveLogs((prev) => [payload.new as AdminLog, ...prev].slice(0, 100));
-        },
-      )
-      .subscribe((status) => setLive(status === "SUBSCRIBED"));
-    return () => {
-      void supabase.removeChannel(channel);
-    };
+    const onVis = () => setVisible(document.visibilityState === "visible");
+    onVis();
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
   }, []);
 
   const logs = data?.logs ?? [];
@@ -89,9 +85,57 @@ export function LogsTab() {
       : [];
   const display = [...liveExtra, ...logs];
 
-  const resetPage = () => setOffset(0);
+  // 보유한 가장 최신 로그의 created_at(폴링 기준점).
+  const newest = display.reduce<string | null>(
+    (acc, l) => (acc && acc >= l.created_at ? acc : l.created_at),
+    null,
+  );
+  const polling = visible && offset === 0 && !isLoading;
+
+  const pollInFlight = useRef(false);
+
+  // ── 폴링: after=<최신 created_at>로 더 새로운 턴만 받아 맨 위에 합친다(id 중복 제거) ──
+  useEffect(() => {
+    if (!polling) return;
+    let cancelled = false;
+    const timer = window.setInterval(async () => {
+      // 이전 폴링이 아직 진행 중이면 이번 주기는 건너뛴다(요청 중첩 방지).
+      if (pollInFlight.current) return;
+      pollInFlight.current = true;
+      try {
+        const res = await getAdminLogs({
+          userId: userId || null,
+          since: since || null,
+          until: until || null,
+          after: newest,
+          limit: 50,
+          offset: 0,
+        });
+        if (cancelled || res.logs.length === 0) return;
+        setLiveLogs((prev) => {
+          const seen = new Set(prev.map((x) => x.id));
+          const fresh = res.logs.filter((x) => !seen.has(x.id));
+          return fresh.length ? [...fresh, ...prev].slice(0, 100) : prev;
+        });
+      } catch {
+        /* 일시 오류는 다음 주기에 재시도 */
+      } finally {
+        pollInFlight.current = false;
+      }
+    }, POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [polling, userId, since, until, newest]);
+
+  // 필터가 바뀌면 이전 필터로 모은 신규분은 버리고 첫 페이지부터.
+  const resetPage = () => {
+    setOffset(0);
+    setLiveLogs([]);
+  };
   const emailFor = (ownerId: string) =>
-    users?.find((u) => u.id === ownerId)?.email ?? ownerId;
+    userLabel(users?.find((u) => u.id === ownerId), ownerId);
 
   return (
     <div className="flex flex-col gap-3">
@@ -99,14 +143,18 @@ export function LogsTab() {
         <h2 className="text-sm font-semibold text-[#e7e3d8]">채팅 턴 로그</h2>
         <span
           className={`flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium ${
-            live
+            polling
               ? "bg-[#e0796a]/20 text-[#e0796a]"
               : "bg-white/5 text-[#9a948a]"
           }`}
-          title={live ? "실시간 구독 중" : "구독 대기"}
+          title={
+            polling
+              ? `${POLL_MS / 1000}초마다 새 턴을 확인합니다`
+              : "첫 페이지에서 탭이 보일 때만 자동 새로고침합니다"
+          }
         >
           <Radio size={11} />
-          {live ? "LIVE" : "연결 중…"}
+          {polling ? `자동 새로고침 ${POLL_MS / 1000}초` : "자동 새로고침 일시정지"}
         </span>
 
         <select
@@ -120,7 +168,7 @@ export function LogsTab() {
           <option value="">전체 사용자</option>
           {(users ?? []).map((u) => (
             <option key={u.id} value={u.id}>
-              {u.email || u.id}
+              {userLabel(u, u.id)}
             </option>
           ))}
         </select>

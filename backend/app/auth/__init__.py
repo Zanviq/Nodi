@@ -1,1 +1,1 @@
-"""Authentication: Supabase JWT (JWKS / ES256) verification + role guards."""
+"""Authentication: username/password accounts, session cookie (HS256 JWT) + role guards."""

@@ -50,7 +50,9 @@ export function UsageTab() {
             ) : (
               rows.map((u) => (
                 <tr key={u.owner_id} className="border-t border-white/5">
-                  <td className="px-3 py-2">{u.email || u.owner_id}</td>
+                  <td className="px-3 py-2">
+                    {u.display_name || u.username || u.email || u.owner_id}
+                  </td>
                   <td className="px-3 py-2 text-right tabular-nums">
                     {u.total_tokens.toLocaleString()}
                   </td>

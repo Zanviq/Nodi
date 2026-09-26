@@ -16,10 +16,11 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Query
 
+from ..ai_key import GeminiKeyError, key_http_error, require_gemini_key
 from ..auth.deps import CurrentUser, get_current_user
 from ..config import get_settings
+from ..db.client import UserClient
 from ..services import gemini, home
-from ..services.supabase_client import UserClient
 
 router = APIRouter(prefix="/home", tags=["home"])
 settings = get_settings()
@@ -48,17 +49,24 @@ async def home_summary(
 async def home_suggestions(
     count: int = Query(3, ge=1, le=5),
     user: CurrentUser = Depends(get_current_user),
+    api_key: str = Depends(require_gemini_key),
 ) -> dict[str, Any]:
     """D5 (1st pass): top-concept-based starter questions. Each suggestion, when
-    clicked, should start a NEW personal session seeded with the question."""
+    clicked, should start a NEW personal session seeded with the question.
+
+    AI endpoint: 400 `gemini_key_required` without `X-Gemini-Key`."""
     client = UserClient.from_user(user)
     concepts = await home.get_top_concepts(client, "personal", user.id, 10)
     recents = await home.get_recent_sessions(client, limit=8)
-    questions = await gemini.generate_home_suggestions(
-        [c.get("name") for c in concepts if c.get("name")],
-        [r.get("title") for r in recents if r.get("title")],
-        count,
-    )
+    try:
+        questions = await gemini.generate_home_suggestions(
+            [c.get("name") for c in concepts if c.get("name")],
+            [r.get("title") for r in recents if r.get("title")],
+            count,
+            api_key,
+        )
+    except GeminiKeyError as exc:  # invalid key / quota -> 400 with its code
+        raise key_http_error(exc.code) from None
     suggestions = [
         {
             "question": q,

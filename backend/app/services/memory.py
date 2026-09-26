@@ -16,7 +16,7 @@ current branch (architecture §4/§5). When assembling chat context we:
     SOURCE-LABELLED reference block injected separately from the live branch.
 
 Everything is best-effort: failure -> no imported context, never breaks chat.
-All reads use the caller's RLS-scoped client (own data only).
+All reads use the caller's access-checked client (own data only).
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ import logging
 from typing import Any
 
 from ..config import get_settings
-from .supabase_client import UserClient
+from ..db.client import UserClient
 
 logger = logging.getLogger("nodi.memory")
 settings = get_settings()
@@ -197,7 +197,7 @@ async def build_comparison_context(
     Unlike Stage 3a memory linking, this is NOT persisted into node.connections.
     Rendered under a distinct "[브랜치 참조 — 비교]" label so the model keeps it
     separate from the live branch / imported / RAG blocks. Only nodes the caller
-    can access are used (RLS).
+    can access are used (access layer).
 
     LCA trim (D46): a reference in the CURRENT session reuses ``current_by_id``
     and is trimmed to the segment BELOW the lowest common ancestor (drop the

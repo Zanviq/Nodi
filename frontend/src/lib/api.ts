@@ -1,4 +1,4 @@
-import { createClient } from "@/lib/supabase/client";
+import { readGeminiKey } from "@/lib/geminiKey";
 import { assertRealId, isRealId } from "@/lib/ids";
 import type {
   AdminLogDetail,
@@ -20,6 +20,7 @@ import type {
   FileSuggestion,
   HomeSuggestions,
   HomeSummary,
+  MyClass,
   NavigatorDefaults,
   OverseerDoneEvent,
   Profile,
@@ -33,80 +34,202 @@ import type {
   UserRole,
 } from "@/lib/types";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "";
+/**
+ * 백엔드는 같은 오리진의 `/api/*`로 호출한다(next.config.ts rewrite → BACKEND_URL).
+ * 세션은 httpOnly 쿠키(nodi_session)라 JS가 토큰을 다루지 않는다 — 토큰 캐시 없음.
+ */
+const API_BASE = "/api";
 
 /**
- * 08 G(D67): access_token 메모리 캐시. 모든 fetch가 호출당 `getSession()`을 await하던
- * 비용을 줄인다(보통 로컬 캐시지만 보장 없음). expires_at까지 재사용하되 만료 60초 전엔
- * getSession을 다시 불러 supabase가 갱신한 최신 토큰을 받는다(안전 마진).
+ * 공통 요청 헤더.
+ * - json: Content-Type 지정.
+ * - ai: AI를 쓰는 엔드포인트에만 사용자 본인의 Gemini 키를 X-Gemini-Key로 싣는다
+ *   (localStorage에서 매번 직접 읽음 — 메모리 캐시 없음, URL/로그에 절대 넣지 않음).
  */
-let tokenCache: { token: string; expiresAtMs: number } | null = null;
-
-/**
- * 08 M1: access_token 캐시 무효화. 인증 상태가 바뀌면(로그아웃/로그인/토큰 갱신)
- * 반드시 호출해 캐시가 만료 전 옛 토큰을 들고 있는 것을 막는다(동작 불변 보장).
- * Providers의 supabase onAuthStateChange가 모든 이벤트에서 호출한다.
- */
-export function clearTokenCache(): void {
-  tokenCache = null;
-}
-
-async function getAccessToken(): Promise<string | null> {
-  const now = Date.now();
-  if (tokenCache && tokenCache.expiresAtMs - 60_000 > now) {
-    return tokenCache.token;
-  }
-  const supabase = createClient();
-  const {
-    data: { session },
-  } = await supabase.auth.getSession();
-  if (session?.access_token) {
-    tokenCache = {
-      token: session.access_token,
-      // expires_at은 unix 초. 없으면 보수적으로 1분만 캐시.
-      expiresAtMs: session.expires_at
-        ? session.expires_at * 1000
-        : now + 60_000,
-    };
-    return session.access_token;
-  }
-  tokenCache = null;
-  return null;
-}
-
-/** Supabase 세션의 access_token을 Authorization 헤더로. (키 하드코딩 없음) */
-async function authHeaders(json = false): Promise<Record<string, string>> {
-  const token = await getAccessToken();
+function authHeaders(json = false, ai = false): Record<string, string> {
   const headers: Record<string, string> = {};
-  if (token) {
-    headers.Authorization = `Bearer ${token}`;
-  }
   if (json) headers["Content-Type"] = "application/json";
+  if (ai) {
+    const key = readGeminiKey();
+    if (key) headers["X-Gemini-Key"] = key;
+  }
   return headers;
 }
 
-/** HTTP 상태 코드를 보존하는 에러(503 등 분기용). */
+/** 모든 요청 공통 fetch 옵션(쿠키 동봉). */
+function req(init: RequestInit = {}): RequestInit {
+  return { credentials: "include", ...init };
+}
+
+/** HTTP 상태 코드 + (있으면) 기계용 오류 코드를 보존하는 에러. */
 export class ApiError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  code: string | null;
+  constructor(status: number, message: string, code: string | null = null) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.code = code;
   }
+}
+
+/** FastAPI 오류 바디 → {message, code}. detail은 문자열 | {code,message} | 검증오류 배열. */
+function parseErrorBody(
+  body: unknown,
+  status: number,
+): { message: string; code: string | null } {
+  const detail = (body as { detail?: unknown } | null)?.detail;
+  if (typeof detail === "string") return { message: detail, code: null };
+  if (detail && typeof detail === "object" && !Array.isArray(detail)) {
+    const d = detail as { code?: unknown; message?: unknown };
+    return {
+      message:
+        typeof d.message === "string" ? d.message : `요청 실패 (HTTP ${status})`,
+      code: typeof d.code === "string" ? d.code : null,
+    };
+  }
+  if (Array.isArray(detail)) {
+    return { message: "입력값을 확인해 주세요.", code: "validation_error" };
+  }
+  return { message: `요청 실패 (HTTP ${status})`, code: null };
+}
+
+let redirectingToLogin = false;
+
+/**
+ * 세션 만료/미로그인(401): 쿠키를 지우고(/auth/logout) 로그인 화면으로 보낸다.
+ * 쿠키를 먼저 지워야 Proxy(쿠키 존재 검사)와 서로 튕기는 루프가 생기지 않는다.
+ * 로그인 화면 자체에서는 아무것도 하지 않는다.
+ */
+function handleUnauthorized(): void {
+  if (typeof window === "undefined" || redirectingToLogin) return;
+  if (window.location.pathname.startsWith("/login")) return;
+  redirectingToLogin = true;
+  void fetch(`${API_BASE}/auth/logout`, req({ method: "POST" }))
+    .catch(() => undefined)
+    .finally(() => {
+      window.location.assign("/login");
+    });
 }
 
 async function ensureOk(res: Response): Promise<Response> {
   if (!res.ok) {
-    let detail = `HTTP ${res.status}`;
+    let parsed = { message: `요청 실패 (HTTP ${res.status})`, code: null as string | null };
     try {
-      const body = await res.json();
-      detail = body?.detail ?? detail;
+      parsed = parseErrorBody(await res.json(), res.status);
     } catch {
       /* ignore */
     }
-    throw new ApiError(res.status, detail);
+    if (res.status === 401) handleUnauthorized();
+    throw new ApiError(res.status, parsed.message, parsed.code);
   }
   return res;
+}
+
+// ── 인증 (아이디 + 비밀번호, httpOnly 쿠키 세션) ────────────────────────
+
+/** 로그인. 401 invalid_credentials는 리다이렉트 없이 ApiError로 던진다. */
+export async function login(username: string, password: string): Promise<Profile> {
+  const res = await fetch(
+    `${API_BASE}/auth/login`,
+    req({
+      method: "POST",
+      headers: authHeaders(true),
+      body: JSON.stringify({ username, password }),
+    }),
+  );
+  if (!res.ok) {
+    let parsed = { message: "로그인에 실패했습니다.", code: null as string | null };
+    try {
+      parsed = parseErrorBody(await res.json(), res.status);
+    } catch {
+      /* ignore */
+    }
+    throw new ApiError(res.status, parsed.message, parsed.code);
+  }
+  return res.json();
+}
+
+/** 회원가입(성공 시 자동 로그인 쿠키). 409 username_taken 등은 ApiError. */
+export async function register(input: {
+  username: string;
+  password: string;
+  display_name?: string;
+}): Promise<Profile> {
+  const res = await fetch(
+    `${API_BASE}/auth/register`,
+    req({
+      method: "POST",
+      headers: authHeaders(true),
+      body: JSON.stringify(input),
+    }),
+  );
+  if (!res.ok) {
+    let parsed = { message: "가입에 실패했습니다.", code: null as string | null };
+    try {
+      parsed = parseErrorBody(await res.json(), res.status);
+    } catch {
+      /* ignore */
+    }
+    throw new ApiError(res.status, parsed.message, parsed.code);
+  }
+  return res.json();
+}
+
+/** 로그아웃(쿠키 삭제). 실패해도 호출부는 로그인 화면으로 이동한다. */
+export async function logout(): Promise<void> {
+  try {
+    await fetch(`${API_BASE}/auth/logout`, req({ method: "POST" }));
+  } catch {
+    /* ignore */
+  }
+}
+
+/** 현재 사용자. 401(미로그인)이면 null. */
+export async function getMe(): Promise<Profile | null> {
+  try {
+    const res = await ensureOk(await fetch(`${API_BASE}/auth/me`, req()));
+    return res.json();
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 401) return null;
+    throw e;
+  }
+}
+
+/** 표시 이름 변경(1–50자). */
+export async function updateMe(displayName: string): Promise<Profile> {
+  const res = await ensureOk(
+    await fetch(
+      `${API_BASE}/auth/me`,
+      req({
+        method: "PATCH",
+        headers: authHeaders(true),
+        body: JSON.stringify({ display_name: displayName }),
+      }),
+    ),
+  );
+  return res.json();
+}
+
+/** 내가 가입한 학급 목록. */
+export async function listMyClasses(): Promise<MyClass[]> {
+  const res = await ensureOk(await fetch(`${API_BASE}/auth/me/classes`, req()));
+  return res.json();
+}
+
+/** 학급 코드로 가입(멱등). 잘못된 코드는 404 invalid_join_code. */
+export async function joinClassByCode(code: string): Promise<MyClass> {
+  const res = await ensureOk(
+    await fetch(
+      `${API_BASE}/auth/me/classes/join`,
+      req({
+        method: "POST",
+        headers: authHeaders(true),
+        body: JSON.stringify({ code }),
+      }),
+    ),
+  );
+  return res.json();
 }
 
 export interface SpaceTarget {
@@ -125,7 +248,8 @@ export async function listSessions(target: SpaceTarget): Promise<SessionRow[]> {
   if (target.space_ref) params.set("space_ref", target.space_ref);
   const res = await ensureOk(
     await fetch(`${API_BASE}/sessions?${params.toString()}`, {
-      headers: await authHeaders(),
+      credentials: "include",
+      headers: authHeaders(),
     }),
   );
   return res.json();
@@ -138,7 +262,8 @@ export async function createSession(
   const res = await ensureOk(
     await fetch(`${API_BASE}/sessions`, {
       method: "POST",
-      headers: await authHeaders(true),
+      credentials: "include",
+      headers: authHeaders(true),
       body: JSON.stringify({
         space_kind: target.space_kind,
         space_ref: target.space_ref ?? undefined,
@@ -157,7 +282,8 @@ export async function patchSession(
   const res = await ensureOk(
     await fetch(`${API_BASE}/sessions/${id}`, {
       method: "PATCH",
-      headers: await authHeaders(true),
+      credentials: "include",
+      headers: authHeaders(true),
       body: JSON.stringify({ title }),
     }),
   );
@@ -169,7 +295,8 @@ export async function deleteSession(id: string): Promise<void> {
   await ensureOk(
     await fetch(`${API_BASE}/sessions/${id}`, {
       method: "DELETE",
-      headers: await authHeaders(),
+      credentials: "include",
+      headers: authHeaders(),
     }),
   );
 }
@@ -178,7 +305,8 @@ export async function deleteSession(id: string): Promise<void> {
 export async function getNavigatorDefaults(): Promise<NavigatorDefaults> {
   const res = await ensureOk(
     await fetch(`${API_BASE}/auth/me/navigator-defaults`, {
-      headers: await authHeaders(),
+      credentials: "include",
+      headers: authHeaders(),
     }),
   );
   return res.json();
@@ -189,7 +317,8 @@ export async function completeOnboarding(): Promise<void> {
   await ensureOk(
     await fetch(`${API_BASE}/auth/complete-onboarding`, {
       method: "POST",
-      headers: await authHeaders(),
+      credentials: "include",
+      headers: authHeaders(),
     }),
   );
 }
@@ -197,7 +326,8 @@ export async function completeOnboarding(): Promise<void> {
 export async function getSession(id: string): Promise<SessionDetail> {
   const res = await ensureOk(
     await fetch(`${API_BASE}/sessions/${id}`, {
-      headers: await authHeaders(),
+      credentials: "include",
+      headers: authHeaders(),
     }),
   );
   return res.json();
@@ -214,7 +344,8 @@ function spaceParams(target: SpaceTarget): URLSearchParams {
 export async function listTags(target: SpaceTarget): Promise<TagRow[]> {
   const res = await ensureOk(
     await fetch(`${API_BASE}/tags?${spaceParams(target).toString()}`, {
-      headers: await authHeaders(),
+      credentials: "include",
+      headers: authHeaders(),
     }),
   );
   return res.json();
@@ -226,7 +357,7 @@ export async function listCooccurrence(
   const res = await ensureOk(
     await fetch(
       `${API_BASE}/tags/cooccurrence?${spaceParams(target).toString()}`,
-      { headers: await authHeaders() },
+      { credentials: "include", headers: authHeaders() },
     ),
   );
   return res.json();
@@ -238,14 +369,18 @@ export async function deleteNode(id: string): Promise<void> {
   await ensureOk(
     await fetch(`${API_BASE}/nodes/${id}`, {
       method: "DELETE",
-      headers: await authHeaders(),
+      credentials: "include",
+      headers: authHeaders(),
     }),
   );
 }
 
 // ── 파일 / RAG (Stage 3b) ────────────────────────────────────────────
 
-/** 멀티파트 업로드. service_role 미설정 시 백엔드 503. (Content-Type 미지정 — FormData가 boundary 설정) */
+/**
+ * 멀티파트 업로드(서버가 즉시 처리해 최종 행 반환). 키가 없으면 저장·분할만 되고
+ * status=needs_key. (Content-Type 미지정 — FormData가 boundary 설정)
+ */
 export async function uploadFile(
   target: SpaceTarget,
   file: File,
@@ -267,7 +402,8 @@ export async function uploadFile(
   const res = await ensureOk(
     await fetch(`${API_BASE}/files`, {
       method: "POST",
-      headers: await authHeaders(), // json=false → Content-Type 없음
+      credentials: "include",
+      headers: authHeaders(false, true), // json=false → Content-Type 없음, AI 키 선택
       body: form,
     }),
   );
@@ -283,7 +419,8 @@ export async function patchFilePosition(
   const res = await ensureOk(
     await fetch(`${API_BASE}/files/${fileId}/position`, {
       method: "PATCH",
-      headers: await authHeaders(true),
+      credentials: "include",
+      headers: authHeaders(true),
       body: JSON.stringify({
         position_x: Math.round(x),
         position_y: Math.round(y),
@@ -296,7 +433,8 @@ export async function patchFilePosition(
 export async function listFiles(target: SpaceTarget): Promise<FileRow[]> {
   const res = await ensureOk(
     await fetch(`${API_BASE}/files?${spaceParams(target).toString()}`, {
-      headers: await authHeaders(),
+      credentials: "include",
+      headers: authHeaders(),
     }),
   );
   return res.json();
@@ -306,7 +444,7 @@ export async function listFiles(target: SpaceTarget): Promise<FileRow[]> {
 
 export async function listTeacherClasses(): Promise<TeacherClass[]> {
   const res = await ensureOk(
-    await fetch(`${API_BASE}/teacher/classes`, { headers: await authHeaders() }),
+    await fetch(`${API_BASE}/teacher/classes`, { credentials: "include", headers: authHeaders() }),
   );
   return res.json();
 }
@@ -315,7 +453,8 @@ export async function listTeacherClasses(): Promise<TeacherClass[]> {
 export async function fetchTeacherOverview(): Promise<TeacherClassOverview[]> {
   const res = await ensureOk(
     await fetch(`${API_BASE}/teacher/classes/overview`, {
-      headers: await authHeaders(),
+      credentials: "include",
+      headers: authHeaders(),
     }),
   );
   return res.json();
@@ -326,7 +465,8 @@ export async function createClass(name: string): Promise<CreatedClass> {
   const res = await ensureOk(
     await fetch(`${API_BASE}/teacher/classes`, {
       method: "POST",
-      headers: await authHeaders(true),
+      credentials: "include",
+      headers: authHeaders(true),
       body: JSON.stringify({ name }),
     }),
   );
@@ -338,7 +478,8 @@ export async function listClassStudents(
 ): Promise<TeacherStudent[]> {
   const res = await ensureOk(
     await fetch(`${API_BASE}/teacher/classes/${classId}/students`, {
-      headers: await authHeaders(),
+      credentials: "include",
+      headers: authHeaders(),
     }),
   );
   return res.json();
@@ -351,7 +492,7 @@ export async function listStudentClassSessions(
   const res = await ensureOk(
     await fetch(
       `${API_BASE}/teacher/classes/${classId}/students/${userId}/sessions`,
-      { headers: await authHeaders() },
+      { credentials: "include", headers: authHeaders() },
     ),
   );
   return res.json();
@@ -360,7 +501,8 @@ export async function listStudentClassSessions(
 export async function listClassMaterials(classId: string): Promise<FileRow[]> {
   const res = await ensureOk(
     await fetch(`${API_BASE}/teacher/classes/${classId}/materials`, {
-      headers: await authHeaders(),
+      credentials: "include",
+      headers: authHeaders(),
     }),
   );
   return res.json();
@@ -368,7 +510,7 @@ export async function listClassMaterials(classId: string): Promise<FileRow[]> {
 
 export async function getFile(id: string): Promise<FileRow> {
   const res = await ensureOk(
-    await fetch(`${API_BASE}/files/${id}`, { headers: await authHeaders() }),
+    await fetch(`${API_BASE}/files/${id}`, { credentials: "include", headers: authHeaders() }),
   );
   return res.json();
 }
@@ -376,30 +518,35 @@ export async function getFile(id: string): Promise<FileRow> {
 /** 파일 태그 목록(3b-3). indexed 파일이면 이름 배열. */
 export async function getFileTags(id: string): Promise<string[]> {
   const res = await ensureOk(
-    await fetch(`${API_BASE}/files/${id}/tags`, { headers: await authHeaders() }),
+    await fetch(`${API_BASE}/files/${id}/tags`, { credentials: "include", headers: authHeaders() }),
   );
   const body = await res.json();
   return (body?.tags as string[]) ?? [];
 }
 
-/** 파일 삭제(3b-3). 204. service_role 미설정 시 503. */
+/** 파일 삭제(3b-3). 204. */
 export async function deleteFile(id: string): Promise<void> {
   await ensureOk(
     await fetch(`${API_BASE}/files/${id}`, {
       method: "DELETE",
-      headers: await authHeaders(),
+      credentials: "include",
+      headers: authHeaders(),
     }),
   );
 }
 
-/** 파일 재처리(3b-3). failed/partial/멈춘 파일. */
-export async function retryFile(id: string): Promise<void> {
-  await ensureOk(
+/** 파일 재처리(3b-3). failed/partial/needs_key 파일. Gemini 키 필요(없으면 400). */
+export async function retryFile(
+  id: string,
+): Promise<{ file_id: string; action: string; file: FileRow }> {
+  const res = await ensureOk(
     await fetch(`${API_BASE}/files/${id}/retry`, {
       method: "POST",
-      headers: await authHeaders(),
+      credentials: "include",
+      headers: authHeaders(false, true),
     }),
   );
+  return res.json();
 }
 
 /** 현재 분기에 연결 파일이 없을 때 제안(3b-3). */
@@ -411,7 +558,7 @@ export async function getFileSuggestions(
   const res = await ensureOk(
     await fetch(
       `${API_BASE}/sessions/${sessionId}/file-suggestions?${params.toString()}`,
-      { headers: await authHeaders() },
+      { credentials: "include", headers: authHeaders(false, true) },
     ),
   );
   const body = await res.json();
@@ -428,7 +575,8 @@ export async function addFileLink(
   const res = await ensureOk(
     await fetch(`${API_BASE}/files/${fileId}/links`, {
       method: "POST",
-      headers: await authHeaders(true),
+      credentials: "include",
+      headers: authHeaders(true),
       body: JSON.stringify({ target_node_id: targetNodeId }),
     }),
   );
@@ -444,7 +592,8 @@ export async function removeFileLink(
   await ensureOk(
     await fetch(`${API_BASE}/files/${fileId}/links/${nodeId}`, {
       method: "DELETE",
-      headers: await authHeaders(),
+      credentials: "include",
+      headers: authHeaders(),
     }),
   );
 }
@@ -461,7 +610,7 @@ export async function getChunkContext(
   const res = await ensureOk(
     await fetch(
       `${API_BASE}/files/chunks/${encodeURIComponent(chunkId)}/context?${params.toString()}`,
-      { headers: await authHeaders() },
+      { credentials: "include", headers: authHeaders() },
     ),
   );
   return res.json();
@@ -472,7 +621,8 @@ export async function listSessionFileLinks(
 ): Promise<FileLink[]> {
   const res = await ensureOk(
     await fetch(`${API_BASE}/sessions/${sessionId}/file-links`, {
-      headers: await authHeaders(),
+      credentials: "include",
+      headers: authHeaders(),
     }),
   );
   return res.json();
@@ -487,7 +637,8 @@ export async function listFileGraphNodes(
 ): Promise<FileGraphNode[]> {
   const res = await ensureOk(
     await fetch(`${API_BASE}/sessions/${sessionId}/file-graph-nodes`, {
-      headers: await authHeaders(),
+      credentials: "include",
+      headers: authHeaders(),
     }),
   );
   return res.json();
@@ -505,7 +656,8 @@ export async function addFileGraphNode(
   const res = await ensureOk(
     await fetch(`${API_BASE}/sessions/${sessionId}/file-graph-nodes`, {
       method: "POST",
-      headers: await authHeaders(true),
+      credentials: "include",
+      headers: authHeaders(true),
       body: JSON.stringify({
         file_id: fileId,
         position_x: x == null ? null : Math.round(x),
@@ -528,7 +680,8 @@ export async function patchFileGraphNode(
   const res = await ensureOk(
     await fetch(`${API_BASE}/sessions/${sessionId}/file-graph-nodes`, {
       method: "PATCH",
-      headers: await authHeaders(true),
+      credentials: "include",
+      headers: authHeaders(true),
       body: JSON.stringify({
         file_id: fileId,
         position_x: Math.round(x),
@@ -549,7 +702,8 @@ export async function removeFileGraphNode(
   await ensureOk(
     await fetch(`${API_BASE}/sessions/${sessionId}/file-graph-nodes/${fileId}`, {
       method: "DELETE",
-      headers: await authHeaders(),
+      credentials: "include",
+      headers: authHeaders(),
     }),
   );
 }
@@ -566,7 +720,8 @@ export async function addConnection(
   const res = await ensureOk(
     await fetch(`${API_BASE}/nodes/${targetId}/connections`, {
       method: "POST",
-      headers: await authHeaders(true),
+      credentials: "include",
+      headers: authHeaders(true),
       body: JSON.stringify({ source_node_id: sourceId }),
     }),
   );
@@ -583,14 +738,15 @@ export async function removeConnection(
   const res = await ensureOk(
     await fetch(`${API_BASE}/nodes/${targetId}/connections/${sourceId}`, {
       method: "DELETE",
-      headers: await authHeaders(),
+      credentials: "include",
+      headers: authHeaders(),
     }),
   );
   return res.json();
 }
 
 // ── SSE 스트리밍 채팅 ────────────────────────────────────────────────
-// EventSource는 Authorization 헤더를 못 실으므로 fetch + ReadableStream 파싱.
+// POST 본문 + X-Gemini-Key 헤더가 필요해 EventSource 대신 fetch + ReadableStream 파싱.
 
 export interface ChatNavigatorOverride {
   enabled?: boolean;
@@ -611,14 +767,10 @@ export interface ChatStreamBody {
 
 /**
  * 노드 좌표 일괄 영속(D20). 드래그 종료/재정렬 시 저장.
- *
- * 08 C(D69): 노드마다 1 RT(서버 for-루프)였던 set_node_positions를 단일 RPC
- * `set_node_positions_bulk`(0026) 1회 호출로 교체한다(N RT→1). RPC는 SECURITY INVOKER라
- * 호출자 JWT + nodes RLS로 owner 본인 노드만 갱신하며, PostgREST rpc 패턴
- * (예: join_class_by_code)을 따라 supabase 클라이언트로 직접 호출한다.
+ * `PUT /sessions/{id}/node-positions` — 서버가 한 번의 bulk 문으로 갱신한다.
  *
  * D52/D63: 영속 직전 비-UUID id(provisional:/optimistic: 등)를 isRealId로 1차 필터한다
- * (RPC도 캐스트 전 필터하지만 이중 방어). 남은 게 없으면 호출 자체를 생략.
+ * (서버도 비-UUID를 건너뛰지만 이중 방어). 남은 게 없으면 호출 자체를 생략.
  */
 export async function putNodePositions(
   sessionId: string,
@@ -627,18 +779,20 @@ export async function putNodePositions(
   if (!isRealId(sessionId)) return;
   const valid = positions.filter((p) => isRealId(p.node_id));
   if (valid.length === 0) return;
-  const supabase = createClient();
-  const { error } = await supabase.rpc("set_node_positions_bulk", {
-    p_session_id: sessionId,
-    p_positions: valid.map((p) => ({
-      node_id: p.node_id,
-      x: Math.round(p.x),
-      y: Math.round(p.y),
-    })),
-  });
-  if (error) {
-    throw new ApiError(500, error.message ?? "좌표 저장에 실패했습니다.");
-  }
+  await ensureOk(
+    await fetch(`${API_BASE}/sessions/${sessionId}/node-positions`, {
+      method: "PUT",
+      credentials: "include",
+      headers: authHeaders(true),
+      body: JSON.stringify({
+        positions: valid.map((p) => ({
+          node_id: p.node_id,
+          x: Math.round(p.x),
+          y: Math.round(p.y),
+        })),
+      }),
+    }),
+  );
 }
 
 export interface ChatStreamHandlers {
@@ -646,7 +800,8 @@ export interface ChatStreamHandlers {
   onToken?: (delta: string) => void;
   onDone?: (data: ChatDoneEvent) => void;
   onNavigator?: (data: ChatNavigatorEvent) => void;
-  onError?: (detail: string) => void;
+  /** code: gemini_key_required / gemini_key_invalid / gemini_quota_exceeded 등(없으면 null). */
+  onError?: (detail: string, code: string | null) => void;
 }
 
 interface SSEEvent {
@@ -673,36 +828,45 @@ function parseFrame(frame: string): SSEEvent | null {
   return { type, data };
 }
 
+/** SSE error 이벤트 → [표시 문구, 코드]. */
+function sseError(data: Record<string, unknown>): [string, string | null] {
+  const detail = typeof data.detail === "string" ? data.detail : "스트리밍 오류";
+  const code = typeof data.code === "string" ? data.code : null;
+  return [detail, code];
+}
+
 /** 공통 SSE 소비기: POST 후 ReadableStream을 프레임 단위로 onEvent에 전달. */
 async function consumeSSE(
   path: string,
   body: unknown,
   onEvent: (ev: SSEEvent) => void,
-  onError: (detail: string) => void,
+  onError: (detail: string, code: string | null) => void,
   signal?: AbortSignal,
 ): Promise<void> {
   let res: Response;
   try {
     res = await fetch(`${API_BASE}${path}`, {
       method: "POST",
-      headers: await authHeaders(true),
+      credentials: "include",
+      headers: authHeaders(true, true),
       body: JSON.stringify(body),
       signal,
     });
   } catch (e) {
     if ((e as Error).name === "AbortError") return;
-    onError("서버에 연결할 수 없습니다.");
+    onError("서버에 연결할 수 없습니다.", null);
     return;
   }
 
   if (!res.ok || !res.body) {
-    let detail = `HTTP ${res.status}`;
+    let parsed = { message: `요청 실패 (HTTP ${res.status})`, code: null as string | null };
     try {
-      detail = (await res.json())?.detail ?? detail;
+      parsed = parseErrorBody(await res.json(), res.status);
     } catch {
       /* ignore */
     }
-    onError(detail);
+    if (res.status === 401) handleUnauthorized();
+    onError(parsed.message, parsed.code);
     return;
   }
 
@@ -732,7 +896,7 @@ async function consumeSSE(
     }
   } catch (e) {
     if ((e as Error).name !== "AbortError") {
-      onError("스트리밍이 중단되었습니다.");
+      onError("스트리밍이 중단되었습니다.", null);
     }
   }
 }
@@ -760,11 +924,11 @@ export async function streamChat(
           handlers.onNavigator?.(ev.data as unknown as ChatNavigatorEvent);
           break;
         case "error":
-          handlers.onError?.((ev.data.detail as string) ?? "스트리밍 오류");
+          handlers.onError?.(...sseError(ev.data));
           break;
       }
     },
-    (d) => handlers.onError?.(d),
+    (d, c) => handlers.onError?.(d, c),
     signal,
   );
 }
@@ -781,7 +945,8 @@ export async function getHomeSummary(
   });
   const res = await ensureOk(
     await fetch(`${API_BASE}/home/summary?${params.toString()}`, {
-      headers: await authHeaders(),
+      credentials: "include",
+      headers: authHeaders(),
     }),
   );
   return res.json();
@@ -790,7 +955,8 @@ export async function getHomeSummary(
 export async function getHomeSuggestions(count = 3): Promise<HomeSuggestions> {
   const res = await ensureOk(
     await fetch(`${API_BASE}/home/suggestions?count=${count}`, {
-      headers: await authHeaders(),
+      credentials: "include",
+      headers: authHeaders(false, true),
     }),
   );
   return res.json();
@@ -799,7 +965,7 @@ export async function getHomeSuggestions(count = 3): Promise<HomeSuggestions> {
 export interface OverseerStreamHandlers {
   onToken?: (delta: string) => void;
   onDone?: (data: OverseerDoneEvent) => void;
-  onError?: (detail: string) => void;
+  onError?: (detail: string, code: string | null) => void;
 }
 
 export async function streamOverseer(
@@ -819,11 +985,11 @@ export async function streamOverseer(
           handlers.onDone?.(ev.data as unknown as OverseerDoneEvent);
           break;
         case "error":
-          handlers.onError?.((ev.data.detail as string) ?? "스트리밍 오류");
+          handlers.onError?.(...sseError(ev.data));
           break;
       }
     },
-    (d) => handlers.onError?.(d),
+    (d, c) => handlers.onError?.(d, c),
     signal,
   );
 }
@@ -832,7 +998,7 @@ export async function streamOverseer(
 
 export async function listAdminUsers(): Promise<AdminUser[]> {
   const res = await ensureOk(
-    await fetch(`${API_BASE}/admin/users`, { headers: await authHeaders() }),
+    await fetch(`${API_BASE}/admin/users`, { credentials: "include", headers: authHeaders() }),
   );
   return res.json();
 }
@@ -844,7 +1010,8 @@ export async function setUserRole(
   const res = await ensureOk(
     await fetch(`${API_BASE}/admin/users/${userId}/role`, {
       method: "POST",
-      headers: await authHeaders(true),
+      credentials: "include",
+      headers: authHeaders(true),
       body: JSON.stringify({ role }),
     }),
   );
@@ -853,7 +1020,7 @@ export async function setUserRole(
 
 export async function listAdminSettings(): Promise<AdminSetting[]> {
   const res = await ensureOk(
-    await fetch(`${API_BASE}/admin/settings`, { headers: await authHeaders() }),
+    await fetch(`${API_BASE}/admin/settings`, { credentials: "include", headers: authHeaders() }),
   );
   return res.json();
 }
@@ -865,7 +1032,8 @@ export async function putAdminSetting(
   const res = await ensureOk(
     await fetch(`${API_BASE}/admin/settings/${encodeURIComponent(key)}`, {
       method: "PUT",
-      headers: await authHeaders(true),
+      credentials: "include",
+      headers: authHeaders(true),
       body: JSON.stringify({ value }),
     }),
   );
@@ -874,7 +1042,7 @@ export async function putAdminSetting(
 
 export async function getAdminUsage(): Promise<AdminUsage> {
   const res = await ensureOk(
-    await fetch(`${API_BASE}/admin/usage`, { headers: await authHeaders() }),
+    await fetch(`${API_BASE}/admin/usage`, { credentials: "include", headers: authHeaders() }),
   );
   return res.json();
 }
@@ -883,6 +1051,8 @@ export async function getAdminLogs(opts: {
   userId?: string | null;
   since?: string | null;
   until?: string | null;
+  /** 폴링: 이 created_at보다 엄격히 새로운 로그만. */
+  after?: string | null;
   limit?: number;
   offset?: number;
 }): Promise<AdminLogsResponse> {
@@ -890,11 +1060,13 @@ export async function getAdminLogs(opts: {
   if (opts.userId) params.set("user_id", opts.userId);
   if (opts.since) params.set("since", opts.since);
   if (opts.until) params.set("until", opts.until);
+  if (opts.after) params.set("after", opts.after);
   params.set("limit", String(opts.limit ?? 20));
   params.set("offset", String(opts.offset ?? 0));
   const res = await ensureOk(
     await fetch(`${API_BASE}/admin/logs?${params.toString()}`, {
-      headers: await authHeaders(),
+      credentials: "include",
+      headers: authHeaders(),
     }),
   );
   return res.json();
@@ -904,7 +1076,8 @@ export async function getAdminLogs(opts: {
 export async function getAdminLogDetail(logId: string): Promise<AdminLogDetail> {
   const res = await ensureOk(
     await fetch(`${API_BASE}/admin/logs/${encodeURIComponent(logId)}`, {
-      headers: await authHeaders(),
+      credentials: "include",
+      headers: authHeaders(),
     }),
   );
   return res.json();
@@ -924,7 +1097,8 @@ export async function getAdminTraces(opts: {
   params.set("offset", String(opts.offset ?? 0));
   const res = await ensureOk(
     await fetch(`${API_BASE}/admin/traces?${params.toString()}`, {
-      headers: await authHeaders(),
+      credentials: "include",
+      headers: authHeaders(),
     }),
   );
   return res.json();

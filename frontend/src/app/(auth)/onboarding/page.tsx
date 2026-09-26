@@ -3,13 +3,12 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useQueryClient } from "@tanstack/react-query";
-import { createClient } from "@/lib/supabase/client";
-import { completeOnboarding } from "@/lib/api";
+import { ApiError, completeOnboarding, joinClassByCode } from "@/lib/api";
 import { useMyClasses, useProfile } from "@/lib/hooks";
 
 /**
  * 온보딩(학급코드) — 최초 가입 1회만(D18).
- * "연결할 학급이 있습니까?" → 학급코드 입력 → join_class_by_code RPC.
+ * "연결할 학급이 있습니까?" → 학급코드 입력 → POST /auth/me/classes/join.
  * 시작 시 complete-onboarding 호출(이후 로그인엔 안 뜸).
  */
 export default function OnboardingPage() {
@@ -35,17 +34,11 @@ export default function OnboardingPage() {
     setError(null);
     setLoading(true);
 
-    const supabase = createClient();
-    const { error } = await supabase.rpc("join_class_by_code", {
-      p_code: trimmed,
-    });
-
-    if (error) {
-      // P0002 = invalid_join_code (잘못된/없는 코드)
-      if (
-        error.code === "P0002" ||
-        error.message?.includes("invalid_join_code")
-      ) {
+    try {
+      await joinClassByCode(trimmed);
+    } catch (e) {
+      // 404 invalid_join_code = 잘못된/없는 코드
+      if (e instanceof ApiError && e.code === "invalid_join_code") {
         setError("유효하지 않은 학급 코드입니다. 다시 확인해 주세요.");
       } else {
         setError("학급 연결 중 문제가 발생했습니다. 잠시 후 다시 시도해 주세요.");

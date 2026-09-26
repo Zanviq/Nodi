@@ -1,21 +1,28 @@
 "use client";
 
 import { useState } from "react";
-import { useRouter } from "next/navigation";
 import { useQueryClient } from "@tanstack/react-query";
-import { createClient } from "@/lib/supabase/client";
-import { useMyClasses, useProfile } from "@/lib/hooks";
+import { KeyRound } from "lucide-react";
+import { ApiError, joinClassByCode, updateMe } from "@/lib/api";
+import { useLogout, useMyClasses, useProfile } from "@/lib/hooks";
+import {
+  maskGeminiKey,
+  openGeminiKeyDialog,
+  useGeminiKey,
+} from "@/lib/geminiKey";
 
 /**
  * 프로필 설정.
- * - 본인 profile 로드(display_name/email/role)
- * - 이름 변경(display_name update)
- * - 학급 추가(join_class_by_code 재사용) + 내 학급 목록
- * - 로그아웃(signOut)
+ * - 본인 profile 로드(username/display_name/role)
+ * - 이름 변경(PATCH /auth/me)
+ * - 학급 추가(POST /auth/me/classes/join) + 내 학급 목록
+ * - Gemini API 키(이 브라우저에만 저장) 설정
+ * - 로그아웃(POST /auth/logout)
  */
 export default function ProfilePage() {
-  const router = useRouter();
   const queryClient = useQueryClient();
+  const handleLogout = useLogout();
+  const geminiKey = useGeminiKey();
   const { data: profile, isLoading: profileLoading } = useProfile();
   const { data: myClasses = [] } = useMyClasses();
 
@@ -36,17 +43,13 @@ export default function ProfilePage() {
 
     setNameMsg(null);
     setSavingName(true);
-    const supabase = createClient();
-    const { error } = await supabase
-      .from("profiles")
-      .update({ display_name: trimmed })
-      .eq("id", profile.id);
-
-    if (error) {
-      setNameMsg("이름을 저장하지 못했습니다.");
-    } else {
+    try {
+      const updated = await updateMe(trimmed.slice(0, 50));
+      queryClient.setQueryData(["profile"], updated);
+      setNameDraft(null);
       setNameMsg("저장되었습니다.");
-      await queryClient.invalidateQueries({ queryKey: ["profile"] });
+    } catch {
+      setNameMsg("이름을 저장하지 못했습니다.");
     }
     setSavingName(false);
   };
@@ -57,16 +60,10 @@ export default function ProfilePage() {
 
     setClassMsg(null);
     setJoining(true);
-    const supabase = createClient();
-    const { error } = await supabase.rpc("join_class_by_code", {
-      p_code: trimmed,
-    });
-
-    if (error) {
-      if (
-        error.code === "P0002" ||
-        error.message?.includes("invalid_join_code")
-      ) {
+    try {
+      await joinClassByCode(trimmed);
+    } catch (e) {
+      if (e instanceof ApiError && e.code === "invalid_join_code") {
         setClassMsg("유효하지 않은 학급 코드입니다.");
       } else {
         setClassMsg("학급 연결에 실패했습니다.");
@@ -81,14 +78,6 @@ export default function ProfilePage() {
     setJoining(false);
   };
 
-  const handleLogout = async () => {
-    const supabase = createClient();
-    await supabase.auth.signOut();
-    queryClient.clear();
-    router.push("/login");
-    router.refresh();
-  };
-
   return (
     <div className="mx-auto flex max-w-2xl flex-col gap-8 p-8">
       <header className="flex items-start justify-between">
@@ -97,8 +86,8 @@ export default function ProfilePage() {
           <p className="mt-1 text-sm text-fg-muted">
             {profileLoading
               ? "불러오는 중…"
-              : profile?.email
-                ? `${profile.email}${profile.role ? ` · ${profile.role}` : ""}`
+              : profile?.username
+                ? `@${profile.username}${profile.role ? ` · ${profile.role}` : ""}`
                 : "이름과 가입 학급을 관리합니다."}
           </p>
         </div>
@@ -122,6 +111,7 @@ export default function ProfilePage() {
             type="text"
             value={name}
             onChange={(e) => setNameDraft(e.target.value)}
+            maxLength={50}
             placeholder="표시 이름"
             className="flex-1 rounded-lg border border-accent-border/50 bg-bg px-3 py-2 text-sm text-fg placeholder:text-fg-muted"
           />
@@ -135,6 +125,34 @@ export default function ProfilePage() {
           </button>
         </div>
         {nameMsg && <p className="mt-2 text-xs text-fg-muted">{nameMsg}</p>}
+      </section>
+
+      {/* Gemini API 키 */}
+      <section className="rounded-xl border border-accent-border/30 bg-bg-elevated p-5">
+        <h2 className="flex items-center gap-1.5 text-sm font-semibold text-fg">
+          <KeyRound size={14} className="text-accent-deep" />
+          Gemini API 키
+        </h2>
+        <p className="mt-1 text-xs text-fg-muted">
+          AI 대화·추천은 본인의 Gemini API 키로 동작합니다. 키는 이 브라우저에만
+          저장되며 서버에는 저장되지 않습니다.
+        </p>
+        <div className="mt-3 flex items-center gap-2">
+          <span className="flex-1 rounded-lg border border-accent-border/50 bg-bg px-3 py-2 text-sm">
+            {geminiKey ? (
+              <span className="font-mono text-fg">{maskGeminiKey(geminiKey)}</span>
+            ) : (
+              <span className="text-fg-muted">설정되지 않음</span>
+            )}
+          </span>
+          <button
+            type="button"
+            onClick={() => openGeminiKeyDialog()}
+            className="rounded-lg border border-accent-border bg-accent px-4 py-2 text-sm font-medium text-accent-fg transition-colors hover:bg-accent-deep hover:text-white"
+          >
+            {geminiKey ? "변경·삭제" : "키 입력"}
+          </button>
+        </div>
       </section>
 
       {/* 학급 추가 */}

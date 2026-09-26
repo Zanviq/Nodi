@@ -4,7 +4,14 @@ import { useState } from "react";
 import Link from "next/link";
 import { useQueryClient } from "@tanstack/react-query";
 import { MessageSquare, ChevronRight, Lightbulb, TreeDeciduous } from "lucide-react";
-import { useProfile } from "@/lib/hooks";
+import { profileName, useProfile } from "@/lib/hooks";
+import { ApiError } from "@/lib/api";
+import {
+  isGeminiKeyError,
+  useGeminiKeyFirstPrompt,
+  useHasGeminiKey,
+} from "@/lib/geminiKey";
+import { GeminiKeyNotice } from "@/components/settings/GeminiKeyNotice";
 import {
   prefetchSessionData,
   useHomeSummary,
@@ -23,7 +30,17 @@ import type { HomeRecentSession, OverseerAction, SpaceKind } from "@/lib/types";
 export default function HomePage() {
   const { data: profile } = useProfile();
   const { data: summary, isLoading: summaryLoading } = useHomeSummary();
-  const { data: suggestionsData } = useHomeSuggestions();
+  const hasKey = useHasGeminiKey();
+  const {
+    data: suggestionsData,
+    error: suggestionsError,
+    isLoading: suggestionsLoading,
+  } = useHomeSuggestions(hasKey);
+  const suggestionsKeyError =
+    suggestionsError instanceof ApiError &&
+    isGeminiKeyError(suggestionsError.code)
+      ? suggestionsError.message
+      : null;
   const { startSeeded, openSession } = useStartSession();
   const queryClient = useQueryClient();
   const [actionError, setActionError] = useState<string | null>(null);
@@ -33,7 +50,10 @@ export default function HomePage() {
     if (isRealId(id)) prefetchSessionData(queryClient, id);
   };
 
-  const displayName = profile?.display_name ?? profile?.email ?? null;
+  // AI 기능 첫 진입: 키가 없으면 설정 안내를 한 번 띄운다(닫을 수 있음).
+  useGeminiKeyFirstPrompt();
+
+  const displayName = profileName(profile);
   const concepts = summary?.top_concepts ?? [];
   const recent = summary?.recent_sessions ?? [];
   const suggestions = suggestionsData?.suggestions ?? [];
@@ -144,8 +164,22 @@ export default function HomePage() {
           <Lightbulb size={16} className="text-accent-deep" />
           <h2 className="text-sm font-semibold text-fg">이런 질문 어때요?</h2>
         </div>
+        {!hasKey || suggestionsKeyError ? (
+          <GeminiKeyNotice
+            className="mt-3"
+            message={suggestionsKeyError}
+          />
+        ) : (
         <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-3">
-          {suggestions.length === 0
+          {suggestions.length === 0 && !suggestionsLoading
+            ? (
+                <div className="col-span-full rounded-lg border border-dashed border-accent-border/50 px-3 py-3 text-center text-xs text-fg-muted">
+                  {suggestionsError
+                    ? "추천을 불러오지 못했어요."
+                    : "지금은 추천할 질문이 없어요. (API 키가 올바른지도 확인해 주세요)"}
+                </div>
+              )
+            : suggestions.length === 0
             ? [0, 1, 2].map((i) => (
                 <div
                   key={i}
@@ -166,6 +200,7 @@ export default function HomePage() {
                 </button>
               ))}
         </div>
+        )}
       </section>
 
       {/* 대화 내역 + 총괄 AI */}

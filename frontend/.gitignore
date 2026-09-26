@@ -34,7 +34,6 @@ yarn-error.log*
 .env*
 # 단, 예시 템플릿은 커밋 허용 (실제 키 없음)
 !.env.example
-!.env.local.example
 
 # vercel
 .vercel

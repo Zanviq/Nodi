@@ -1,15 +1,16 @@
 "use client";
 
-import { useEffect, useState, type ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { createClient } from "@/lib/supabase/client";
-import { clearTokenCache } from "@/lib/api";
+import { GeminiKeyDialog } from "@/components/settings/GeminiKeyDialog";
+import { GeminiKeyScope } from "@/components/settings/GeminiKeyScope";
 
 /**
  * 전역 클라이언트 Provider.
  * - react-query QueryClient(staleTime 60s 기본).
- * - 08 M1: 인증 상태 변화(로그아웃/로그인/토큰 갱신)마다 api.ts의 access_token
- *   메모리 캐시를 무효화해 옛 토큰이 만료 전 재사용되는 것을 막는다(동작 불변 보장).
+ * - Gemini API 키 설정 다이얼로그(어느 화면에서든 openGeminiKeyDialog()로 연다).
+ * - GeminiKeyScope: 로그인 사용자별로 Gemini 키 범위를 맞춘다(계정 전환 시 갱신).
+ * 세션은 httpOnly 쿠키라 클라이언트 토큰 캐시가 없다.
  */
 export function Providers({ children }: { children: ReactNode }) {
   const [queryClient] = useState(
@@ -24,17 +25,11 @@ export function Providers({ children }: { children: ReactNode }) {
       }),
   );
 
-  useEffect(() => {
-    const supabase = createClient();
-    // SIGNED_OUT/SIGNED_IN/TOKEN_REFRESHED 등 어떤 이벤트든 캐시를 비운다.
-    // (비우면 다음 호출이 getSession으로 최신 토큰을 다시 읽는다 — 저렴·안전.)
-    const { data } = supabase.auth.onAuthStateChange(() => {
-      clearTokenCache();
-    });
-    return () => data.subscription.unsubscribe();
-  }, []);
-
   return (
-    <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    <QueryClientProvider client={queryClient}>
+      <GeminiKeyScope />
+      {children}
+      <GeminiKeyDialog />
+    </QueryClientProvider>
   );
 }

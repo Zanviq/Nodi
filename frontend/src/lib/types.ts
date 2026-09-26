@@ -1,7 +1,10 @@
-// Supabase 도메인 타입 (Stage 0 — 인증/공간/프로필 범위)
+// 도메인 타입 (Stage 0 — 인증/공간/프로필 범위)
 
 export interface Profile {
   id: string;
+  /** 로그인 아이디(아이디+비밀번호 인증). */
+  username?: string | null;
+  /** 항상 null(이메일 미사용) — 하위 호환용. */
   email: string | null;
   role: string | null;
   display_name: string | null;
@@ -20,6 +23,7 @@ export interface ClassRow {
 export interface MyClass {
   class_id: string;
   role_in_class: string | null;
+  created_at?: string;
   classes: ClassRow | null;
 }
 
@@ -46,6 +50,7 @@ export interface TeacherClassOverview {
 
 export interface TeacherStudent {
   user_id: string;
+  username?: string | null;
   email: string | null;
   display_name: string | null;
   avatar_url: string | null;
@@ -266,7 +271,9 @@ export type FileStatus =
   | "embedding"
   | "indexed"
   | "partial"
-  | "failed";
+  | "failed"
+  /** 저장(가능하면 분할)됐지만 Gemini 키가 없어 임베딩 대기 — 비진행(terminal) 상태. */
+  | "needs_key";
 
 export interface FileRow {
   id: string;
@@ -357,6 +364,7 @@ export type UserRole = "student" | "teacher" | "admin";
 
 export interface AdminUser {
   id: string;
+  username?: string | null;
   email: string | null;
   role: UserRole | string | null;
   display_name: string | null;
@@ -374,6 +382,8 @@ export interface AdminSetting {
 export interface AdminUsageUser {
   owner_id: string;
   email: string | null;
+  username?: string | null;
+  display_name?: string | null;
   total_tokens: number;
   step_count: number;
 }
