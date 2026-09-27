@@ -70,7 +70,7 @@
 ### 실행
 
 ```bash
-git clone https://github.com/Nodi-Laboratory/Nodi.git
+git clone https://github.com/Zanviq/Nodi.git
 cd Nodi
 cp .env.example .env
 docker compose up
